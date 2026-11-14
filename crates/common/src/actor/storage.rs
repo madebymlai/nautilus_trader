@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Known payload storage charged by owned callback routes.
+//! Known payload storage charged by owned callback routes and actor warmup holds.
 
 #![allow(
     dead_code,
@@ -26,7 +26,7 @@ use nautilus_core::Params;
 use nautilus_model::defi::{Block, Pool};
 use nautilus_model::{
     data::{
-        BookOrder, CustomData, DataType,
+        BookOrder, CustomData, DataType, OrderBookDepth,
         option_chain::{OptionChainSlice, OptionStrikeData},
     },
     events::OrderEventAny,
@@ -34,6 +34,7 @@ use nautilus_model::{
     orderbook::{OrderBook, level::BookLevel},
     types::Price,
 };
+use smallvec::{Array, SmallVec};
 use ustr::Ustr;
 
 /// Measures known storage for a custom-data envelope, excluding the opaque payload.
@@ -96,6 +97,23 @@ pub(super) fn book(book: &OrderBook) -> usize {
                 .saturating_add(size_of::<BookLevel>())
                 .saturating_add(level.len().saturating_mul(size_of::<(u64, BookOrder)>()))
         })
+}
+
+/// Measures levels and counts a depth snapshot keeps on the heap beyond its inline levels.
+#[must_use]
+pub(super) fn depth(depth: &OrderBookDepth) -> usize {
+    spilled(&depth.bids)
+        .saturating_add(spilled(&depth.asks))
+        .saturating_add(spilled(&depth.bid_counts))
+        .saturating_add(spilled(&depth.ask_counts))
+}
+
+fn spilled<A: Array>(items: &SmallVec<A>) -> usize {
+    if items.spilled() {
+        items.capacity().saturating_mul(size_of::<A::Item>())
+    } else {
+        0
+    }
 }
 
 /// Measures option strike entries retained by a chain slice.

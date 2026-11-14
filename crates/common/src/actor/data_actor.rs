@@ -51,6 +51,7 @@ use super::{
     binding::DataActorBinding,
     indicators::{Indicators, SharedActorIndicator},
     registry::try_get_actor_unchecked,
+    warmup::{ActorWarmup, WarmupData, WarmupHold, WarmupSeries},
 };
 #[cfg(feature = "defi")]
 use crate::defi;
@@ -902,9 +903,17 @@ pub trait DataActor {
     /// Handles a received custom data point.
     fn handle_data(&mut self, data: &CustomData)
     where
-        Self: Component,
+        Self: DataActorNative + Component,
     {
         log_received(&data);
+
+        if hold_warmup(
+            self,
+            || WarmupSeries::Data(data.data_type.clone()),
+            || WarmupData::Data(data.clone()),
+        ) {
+            return;
+        }
 
         if self.not_running() {
             log_not_running(&data);
@@ -987,9 +996,17 @@ pub trait DataActor {
     /// Handles received order book deltas.
     fn handle_book_deltas(&mut self, deltas: &OrderBookDeltas)
     where
-        Self: Component,
+        Self: DataActorNative + Component,
     {
         log_received(&deltas);
+
+        if hold_warmup(
+            self,
+            || WarmupSeries::BookDeltas(deltas.instrument_id),
+            || WarmupData::BookDeltas(deltas.clone()),
+        ) {
+            return;
+        }
 
         if self.not_running() {
             log_not_running(&deltas);
@@ -1004,9 +1021,17 @@ pub trait DataActor {
     /// Handles a received order book depth snapshot.
     fn handle_book_depth(&mut self, depth: &OrderBookDepth)
     where
-        Self: Component,
+        Self: DataActorNative + Component,
     {
         log_received(&depth);
+
+        if hold_warmup(
+            self,
+            || WarmupSeries::BookDepth(depth.instrument_id),
+            || WarmupData::BookDepth(Box::new(depth.clone())),
+        ) {
+            return;
+        }
 
         if self.not_running() {
             log_not_running(&depth);
@@ -1021,9 +1046,17 @@ pub trait DataActor {
     /// Handles a received order book reference.
     fn handle_book(&mut self, book: &OrderBook)
     where
-        Self: Component,
+        Self: DataActorNative + Component,
     {
         log_received(&book);
+
+        if hold_warmup(
+            self,
+            || WarmupSeries::Book(book.instrument_id),
+            || WarmupData::Book(book.clone()),
+        ) {
+            return;
+        }
 
         if self.not_running() {
             log_not_running(&book);
@@ -1041,6 +1074,14 @@ pub trait DataActor {
         Self: DataActorNative + Component,
     {
         log_received(&quote);
+
+        if hold_warmup(
+            self,
+            || WarmupSeries::Quotes(quote.instrument_id),
+            || WarmupData::Quote(*quote),
+        ) {
+            return;
+        }
 
         if let Err(e) = self.core().handle_indicators_for_quote(quote) {
             log_error(&e);
@@ -1064,6 +1105,14 @@ pub trait DataActor {
     {
         log_received(&trade);
 
+        if hold_warmup(
+            self,
+            || WarmupSeries::Trades(trade.instrument_id),
+            || WarmupData::Trade(*trade),
+        ) {
+            return;
+        }
+
         if let Err(e) = self.core().handle_indicators_for_trade(trade) {
             log_error(&e);
             return;
@@ -1085,6 +1134,14 @@ pub trait DataActor {
         Self: DataActorNative + Component,
     {
         log_received(&bar);
+
+        if hold_warmup(
+            self,
+            || WarmupSeries::Bars(bar.bar_type.standard()),
+            || WarmupData::Bar(*bar),
+        ) {
+            return;
+        }
 
         if let Err(e) = self.core().handle_indicators_for_bar(bar) {
             log_error(&e);
@@ -1138,9 +1195,17 @@ pub trait DataActor {
     /// Handles a received funding rate update.
     fn handle_funding_rate(&mut self, funding_rate: &FundingRateUpdate)
     where
-        Self: Component,
+        Self: DataActorNative + Component,
     {
         log_received(&funding_rate);
+
+        if hold_warmup(
+            self,
+            || WarmupSeries::FundingRates(funding_rate.instrument_id),
+            || WarmupData::FundingRate(*funding_rate),
+        ) {
+            return;
+        }
 
         if self.not_running() {
             log_not_running(&funding_rate);
@@ -1338,9 +1403,11 @@ pub trait DataActor {
     }
 
     /// Handles a historical payload before its generic completion hook.
+    ///
+    /// A terminal envelope delivers the live data its request held before the completion hook.
     fn handle_response(&mut self, envelope: &DataResponseEnvelope)
     where
-        Self: DataActorNative,
+        Self: DataActorNative + Component,
     {
         let Some(scope) = self.core().begin_response(envelope.correlation_id()) else {
             return;
@@ -1362,10 +1429,12 @@ pub trait DataActor {
             }
         }
 
-        if self.core().complete_request(envelope, &scope)
-            && let Err(e) = self.on_data_response(envelope)
-        {
-            log_error(&e);
+        if self.core().complete_request(envelope, &scope) {
+            release_warmup(self);
+
+            if let Err(e) = self.on_data_response(envelope) {
+                log_error(&e);
+            }
         }
 
         drop(scope);
@@ -3416,6 +3485,7 @@ pub struct DataActorCore {
     indicators: Indicators,
     warning_events: AHashSet<String>, // TODO: TBD
     requests: RefCell<RequestLifecycle>,
+    warmup: RefCell<ActorWarmup>,
     signal_classes: AHashMap<String, String>,
     #[cfg(feature = "defi")]
     block_handlers: AHashMap<MStr<Topic>, Subscription<TypedHandler<Block>>>,
@@ -4318,6 +4388,7 @@ impl DataActorCore {
             indicators: Indicators::default(),
             warning_events: AHashSet::new(),
             requests: RefCell::new(RequestLifecycle::default()),
+            warmup: RefCell::new(ActorWarmup::default()),
             signal_classes: AHashMap::new(),
             #[cfg(feature = "defi")]
             block_handlers: AHashMap::new(),
@@ -6350,7 +6421,7 @@ impl DataActorCore {
             params,
         });
 
-        self.register_request_handler(command.request_id(), handler)?;
+        self.register_request_handler(&command, handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6390,7 +6461,7 @@ impl DataActorCore {
             params,
         });
 
-        self.register_request_handler(command.request_id(), handler)?;
+        self.register_request_handler(&command, handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6427,7 +6498,7 @@ impl DataActorCore {
             params,
         });
 
-        self.register_request_handler(command.request_id(), handler)?;
+        self.register_request_handler(&command, handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6462,7 +6533,7 @@ impl DataActorCore {
             params,
         });
 
-        self.register_request_handler(command.request_id(), handler)?;
+        self.register_request_handler(&command, handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6505,7 +6576,7 @@ impl DataActorCore {
             params,
         });
 
-        self.register_request_handler(command.request_id(), handler)?;
+        self.register_request_handler(&command, handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6550,7 +6621,7 @@ impl DataActorCore {
             params,
         });
 
-        self.register_request_handler(command.request_id(), handler)?;
+        self.register_request_handler(&command, handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6597,7 +6668,7 @@ impl DataActorCore {
             params,
         });
 
-        self.register_request_handler(command.request_id(), handler)?;
+        self.register_request_handler(&command, handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6644,7 +6715,7 @@ impl DataActorCore {
             params,
         });
 
-        self.register_request_handler(command.request_id(), handler)?;
+        self.register_request_handler(&command, handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6695,7 +6766,7 @@ impl DataActorCore {
             params,
         });
 
-        self.register_request_handler(command.request_id(), handler)?;
+        self.register_request_handler(&command, handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6738,7 +6809,7 @@ impl DataActorCore {
             params,
         });
 
-        self.register_request_handler(command.request_id(), handler)?;
+        self.register_request_handler(&command, handler)?;
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -6747,13 +6818,15 @@ impl DataActorCore {
 
     fn register_request_handler(
         &self,
-        request_id: &UUID4,
+        command: &RequestCommand,
         handler: TypedHandler<DataResponseEnvelope>,
     ) -> anyhow::Result<()> {
+        let request_id = command.request_id();
         get_message_bus()
             .borrow_mut()
             .register_response_handler(request_id, handler)?;
         self.requests.borrow_mut().register(*request_id);
+        self.warmup.borrow_mut().open(command);
         Ok(())
     }
 
@@ -6789,12 +6862,33 @@ impl DataActorCore {
         self.requests.borrow().is_current(scope)
     }
 
+    /// Completes `response` for its pending request and returns whether it is current.
+    ///
+    /// A terminal envelope releases the live data its request held, for `release_warmup` to
+    /// deliver.
     pub(crate) fn complete_request(
         &self,
         response: &DataResponseEnvelope,
         scope: &ResponseScope,
     ) -> bool {
-        self.requests.borrow_mut().complete(response, scope)
+        if !self.requests.borrow_mut().complete(response, scope) {
+            return false;
+        }
+
+        self.warmup.borrow_mut().complete(response);
+        true
+    }
+
+    pub(super) fn hold_warmup(
+        &self,
+        series: impl FnOnce() -> WarmupSeries,
+        data: impl FnOnce() -> WarmupData,
+    ) -> WarmupHold {
+        self.warmup.borrow_mut().hold(series, data)
+    }
+
+    pub(super) fn next_released_warmup(&self) -> Option<WarmupData> {
+        self.warmup.borrow_mut().next_released()
     }
 
     pub(crate) fn next_group_response(
@@ -6807,6 +6901,7 @@ impl DataActorCore {
     }
 
     fn clear_pending_requests(&self) {
+        self.warmup.borrow_mut().clear();
         let (ids, mut handlers) = self.requests.borrow_mut().clear();
         {
             let bus = get_message_bus();
@@ -6929,6 +7024,47 @@ fn check_timestamps(
     }
 
     Ok(())
+}
+
+/// Returns whether a pending `update_subscriptions` request holds the live item of `series` that
+/// `data` builds.
+///
+/// When the item's series reached its cap, delivers the data it released before returning.
+fn hold_warmup<A>(
+    actor: &mut A,
+    series: impl FnOnce() -> WarmupSeries,
+    data: impl FnOnce() -> WarmupData,
+) -> bool
+where
+    A: DataActor + DataActorNative + Component + ?Sized,
+{
+    match actor.core().hold_warmup(series, data) {
+        WarmupHold::Pass => false,
+        WarmupHold::Held => true,
+        WarmupHold::Released => {
+            release_warmup(actor);
+            false
+        }
+    }
+}
+
+/// Delivers the live data held for completed warmups, each through its live handler.
+pub(crate) fn release_warmup<A>(actor: &mut A)
+where
+    A: DataActor + DataActorNative + Component + ?Sized,
+{
+    while let Some(data) = actor.core().next_released_warmup() {
+        match data {
+            WarmupData::Quote(quote) => actor.handle_quote(&quote),
+            WarmupData::Trade(trade) => actor.handle_trade(&trade),
+            WarmupData::Bar(bar) => actor.handle_bar(&bar),
+            WarmupData::BookDeltas(deltas) => actor.handle_book_deltas(&deltas),
+            WarmupData::BookDepth(depth) => actor.handle_book_depth(&depth),
+            WarmupData::Book(book) => actor.handle_book(&book),
+            WarmupData::FundingRate(funding_rate) => actor.handle_funding_rate(&funding_rate),
+            WarmupData::Data(data) => actor.handle_data(&data),
+        }
+    }
 }
 
 fn log_error(e: &anyhow::Error) {

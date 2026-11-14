@@ -327,6 +327,13 @@ These methods work together in a typical workflow:
 1. `request_bars()` loads historical data to initialize indicators or strategy state.
 1. `subscribe_bars()` continues the stream with live bars.
 
+A live bar can arrive before the response. Pass `params={"update_subscriptions": True}` to
+`request_bars()` to hold the actor's live bars until the request completes, so registered indicators and
+`on_bar()` read the history first. See [Actors: warm up live subscriptions](../actors.md#warm-up-live-subscriptions).
+A request that aggregates bars through `"bar_types"` with the same key replays its history into the
+live aggregator before the updates held meanwhile. It also holds the requesting actor's own live data
+of the requested type, such as its trades, as any request with the key does.
+
 The request returns a correlation ID. Historical data arrives through `on_historical_bars()` as a
 `Sequence[Bar]`. Live data arrives through `on_bar()` one bar at a time.
 

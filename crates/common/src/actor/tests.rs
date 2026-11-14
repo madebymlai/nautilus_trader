@@ -69,7 +69,10 @@ use {
     },
 };
 
-use super::{Actor, DataActor, DataActorCore, DataActorNative, data_actor::DataActorConfig};
+use super::{
+    Actor, DataActor, DataActorCore, DataActorNative, data_actor::DataActorConfig,
+    indicators::ActorIndicator, warmup::MAX_HELD,
+};
 use crate::{
     actor::registry::{get_actor, get_actor_unchecked, register_actor},
     cache::Cache,
@@ -296,6 +299,7 @@ struct TestDataActor {
     pub received_socket_state_changes: Vec<SocketStateChanged>,
     pub received_custom_data: Vec<CustomData>,
     responses: Vec<(UUID4, bool, Option<String>, usize, bool)>,
+    deliveries: DeliveryLog,
     request_after_completion: Option<InstrumentId>,
     chained_request: Option<UUID4>,
     response_action: Option<(UUID4, ResponseAction)>,
@@ -345,6 +349,10 @@ impl DataActor for TestDataActor {
     ) -> anyhow::Result<()> {
         assert!(!self.in_response, "response hooks must not overlap");
         self.in_response = true;
+        self.record(Delivery::Response {
+            completed: response.completed(),
+            failure: response.failure_reason().map(str::to_owned),
+        });
         self.responses.push((
             *response.correlation_id(),
             response.completed(),
@@ -399,6 +407,7 @@ impl DataActor for TestDataActor {
     }
 
     fn on_data(&mut self, data: &CustomData) -> anyhow::Result<()> {
+        self.record(Delivery::Handler("data", data.data.ts_event().as_u64()));
         self.received_data.push(data.data_type.to_string());
         self.received_custom_data.push(data.clone());
         Ok(())
@@ -420,36 +429,46 @@ impl DataActor for TestDataActor {
     }
 
     fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
+        self.record(Delivery::Handler("deltas", deltas.ts_event.as_u64()));
         self.received_deltas.extend(&deltas.deltas);
         Ok(())
     }
 
     fn on_book_depth(&mut self, depth: &OrderBookDepth) -> anyhow::Result<()> {
+        self.record(Delivery::Handler("depth", depth.ts_event.as_u64()));
         self.received_depths.push(depth.clone());
         Ok(())
     }
 
     fn on_book(&mut self, book: &OrderBook) -> anyhow::Result<()> {
+        self.record(Delivery::Handler("book", book.ts_last.as_u64()));
         self.received_books.push(book.clone());
         Ok(())
     }
 
     fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
+        self.record(Delivery::Handler("quote", quote.ts_event.as_u64()));
         self.received_quotes.push(*quote);
         Ok(())
     }
 
     fn on_trade(&mut self, trade: &TradeTick) -> anyhow::Result<()> {
+        self.record(Delivery::Handler("trade", trade.ts_event.as_u64()));
         self.received_trades.push(*trade);
         Ok(())
     }
 
     fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
+        self.record(Delivery::Handler("bar", bar.ts_event.as_u64()));
         self.received_bars.push(*bar);
         Ok(())
     }
 
     fn on_historical_quotes(&mut self, quotes: &[QuoteTick]) -> anyhow::Result<()> {
+        self.record(Delivery::historical(
+            "quote",
+            quotes.iter().map(|q| q.ts_event),
+        ));
         // Push to common received vec
         self.received_quotes.extend(quotes);
 
@@ -461,17 +480,29 @@ impl DataActor for TestDataActor {
     }
 
     fn on_historical_trades(&mut self, trades: &[TradeTick]) -> anyhow::Result<()> {
+        self.record(Delivery::historical(
+            "trade",
+            trades.iter().map(|t| t.ts_event),
+        ));
         // Push to common received vec
         self.received_trades.extend(trades);
         Ok(())
     }
 
     fn on_historical_book_deltas(&mut self, deltas: &[OrderBookDelta]) -> anyhow::Result<()> {
+        self.record(Delivery::historical(
+            "deltas",
+            deltas.iter().map(|d| d.ts_event),
+        ));
         self.received_deltas.extend(deltas);
         Ok(())
     }
 
     fn on_historical_book_depth(&mut self, depths: &[OrderBookDepth]) -> anyhow::Result<()> {
+        self.record(Delivery::historical(
+            "depth",
+            depths.iter().map(|d| d.ts_event),
+        ));
         self.received_depths.extend(depths.iter().cloned());
         Ok(())
     }
@@ -480,11 +511,16 @@ impl DataActor for TestDataActor {
         &mut self,
         funding_rates: &[FundingRateUpdate],
     ) -> anyhow::Result<()> {
+        self.record(Delivery::historical(
+            "funding",
+            funding_rates.iter().map(|f| f.ts_event),
+        ));
         self.received_funding_rates.extend(funding_rates);
         Ok(())
     }
 
     fn on_historical_bars(&mut self, bars: &[Bar]) -> anyhow::Result<()> {
+        self.record(Delivery::historical("bar", bars.iter().map(|b| b.ts_event)));
         // Push to common received vec
         self.received_bars.extend(bars);
         Ok(())
@@ -494,6 +530,10 @@ impl DataActor for TestDataActor {
         if let Some(custom_data) = data.downcast_ref::<CustomData>() {
             self.received_custom_data.push(custom_data.clone());
         } else if let Some(custom_data) = data.downcast_ref::<Vec<CustomData>>() {
+            self.record(Delivery::historical(
+                "data",
+                custom_data.iter().map(|d| d.data.ts_event()),
+            ));
             self.received_custom_data.extend_from_slice(custom_data);
         }
 
@@ -512,6 +552,7 @@ impl DataActor for TestDataActor {
     }
 
     fn on_funding_rate(&mut self, funding_rate: &FundingRateUpdate) -> anyhow::Result<()> {
+        self.record(Delivery::Handler("funding", funding_rate.ts_event.as_u64()));
         self.received_funding_rates.push(*funding_rate);
         Ok(())
     }
@@ -608,6 +649,7 @@ impl TestDataActor {
             received_socket_state_changes: Vec::new(),
             received_custom_data: Vec::new(),
             responses: Vec::new(),
+            deliveries: DeliveryLog::default(),
             request_after_completion: None,
             chained_request: None,
             response_action: None,
@@ -631,6 +673,10 @@ impl TestDataActor {
 
     #[allow(dead_code)]
     pub(crate) fn custom_function(&self) {}
+
+    fn record(&self, delivery: Delivery) {
+        self.deliveries.borrow_mut().push(delivery);
+    }
 }
 
 #[fixture]
@@ -8905,4 +8951,549 @@ fn test_option_chain_zero_interval_has_no_side_effects(
             0
         );
     }
+}
+
+/// A callback a warming actor receives, with the `ts_event` of each item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Delivery {
+    Indicator(&'static str, u64),
+    Handler(&'static str, u64),
+    Historical(&'static str, Vec<u64>),
+    Response {
+        completed: bool,
+        failure: Option<String>,
+    },
+}
+
+impl Delivery {
+    fn historical(kind: &'static str, ts: impl Iterator<Item = UnixNanos>) -> Self {
+        Self::Historical(kind, ts.map(|ts| ts.as_u64()).collect())
+    }
+}
+
+type DeliveryLog = Rc<RefCell<Vec<Delivery>>>;
+
+#[derive(Debug)]
+struct RecordingIndicator {
+    log: DeliveryLog,
+}
+
+impl ActorIndicator for RecordingIndicator {
+    fn key(&self) -> usize {
+        std::ptr::from_ref(self).cast::<()>() as usize
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn initialized(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    fn handle_quote(&self, quote: &QuoteTick) -> anyhow::Result<()> {
+        let delivery = Delivery::Indicator("quote", quote.ts_event.as_u64());
+        self.log.borrow_mut().push(delivery);
+        Ok(())
+    }
+
+    fn handle_trade(&self, trade: &TradeTick) -> anyhow::Result<()> {
+        let delivery = Delivery::Indicator("trade", trade.ts_event.as_u64());
+        self.log.borrow_mut().push(delivery);
+        Ok(())
+    }
+
+    fn handle_bar(&self, bar: &Bar) -> anyhow::Result<()> {
+        let delivery = Delivery::Indicator("bar", bar.ts_event.as_u64());
+        self.log.borrow_mut().push(delivery);
+        Ok(())
+    }
+}
+
+/// The live data types an `update_subscriptions` request holds.
+#[derive(Clone, Copy, Debug)]
+enum WarmupKind {
+    Quote,
+    Trade,
+    Bar,
+    BookDeltas,
+    BookDepth,
+    Book,
+    FundingRate,
+    Data,
+}
+
+const BOOK_INTERVAL_MS: usize = 1_000;
+
+fn warmup_bar_type() -> BarType {
+    BarType::from_str("AUD/USD.SIM-1-MINUTE-LAST-EXTERNAL").unwrap()
+}
+
+fn warmup_data_type() -> DataType {
+    DataType::new(TestActorCustomData::type_name_static(), None, None)
+}
+
+fn update_subscriptions() -> Params {
+    let entry = ("update_subscriptions".to_string(), serde_json::json!(true));
+    Params::new([entry].into())
+}
+
+// Live copies arrive after the venue event, so `ts_init` trails `ts_event`
+fn warmup_quote(ts: u64) -> QuoteTick {
+    QuoteTick {
+        instrument_id: audusd_sim().id,
+        ts_event: UnixNanos::from(ts),
+        ts_init: UnixNanos::from(ts + 1_000),
+        ..QuoteTick::default()
+    }
+}
+
+fn warmup_trade(ts: u64) -> TradeTick {
+    TradeTick {
+        instrument_id: audusd_sim().id,
+        ts_event: UnixNanos::from(ts),
+        ts_init: UnixNanos::from(ts + 1_000),
+        ..TradeTick::default()
+    }
+}
+
+fn warmup_bar(ts: u64) -> Bar {
+    Bar {
+        bar_type: warmup_bar_type(),
+        ts_event: UnixNanos::from(ts),
+        ts_init: UnixNanos::from(ts + 1_000),
+        ..Bar::default()
+    }
+}
+
+fn warmup_delta(ts: u64) -> OrderBookDelta {
+    OrderBookDelta::clear(audusd_sim().id, ts, ts.into(), (ts + 1_000).into())
+}
+
+fn warmup_depth(ts: u64) -> OrderBookDepth {
+    OrderBookDepth {
+        instrument_id: audusd_sim().id,
+        ts_event: UnixNanos::from(ts),
+        ts_init: UnixNanos::from(ts + 1_000),
+        ..stub_depth10()
+    }
+}
+
+fn warmup_book(ts: u64) -> OrderBook {
+    let mut book = OrderBook::new(audusd_sim().id, BookType::L2_MBP);
+    book.ts_last = UnixNanos::from(ts);
+    book
+}
+
+fn warmup_funding_rate(ts: u64) -> FundingRateUpdate {
+    let (ts_event, ts_init) = (ts.into(), (ts + 1_000).into());
+    FundingRateUpdate::new(audusd_sim().id, dec!(0.0001), None, None, ts_event, ts_init)
+}
+
+fn warmup_custom(ts: u64) -> CustomData {
+    let data = TestActorCustomData {
+        label: format!("warmup-{ts}"),
+        ts_event: UnixNanos::from(ts),
+        ts_init: UnixNanos::from(ts + 1_000),
+    };
+    CustomData::new(Arc::new(data), warmup_data_type())
+}
+
+impl WarmupKind {
+    fn subscribe(self, actor: &mut TestDataActor) {
+        let id = audusd_sim().id;
+        let book_type = BookType::L2_MBP;
+
+        match self {
+            Self::Quote => actor.subscribe_quotes(id, None, None),
+            Self::Trade => actor.subscribe_trades(id, None, None),
+            Self::Bar => actor.subscribe_bars(warmup_bar_type(), None, None),
+            Self::BookDeltas => actor.subscribe_book_deltas(id, book_type, None, None, false, None),
+            Self::BookDepth => actor.subscribe_book_depth(id, book_type, None, None, false, None),
+            Self::Book => {
+                let interval = NonZeroUsize::new(BOOK_INTERVAL_MS).unwrap();
+                actor.subscribe_book_at_interval(id, book_type, None, interval, None, None);
+            }
+            Self::FundingRate => actor.subscribe_funding_rates(id, None, None),
+            Self::Data => actor.subscribe_data(warmup_data_type(), None, None),
+        }
+    }
+
+    fn request(self, actor: &mut TestDataActor, params: Option<Params>) -> UUID4 {
+        let id = audusd_sim().id;
+
+        match self {
+            Self::Quote => actor.request_quotes(id, None, None, None, None, params),
+            Self::Trade => actor.request_trades(id, None, None, None, None, params),
+            Self::Bar => actor.request_bars(warmup_bar_type(), None, None, None, None, params),
+            Self::BookDeltas => actor.request_book_deltas(id, None, None, None, None, params),
+            Self::BookDepth => actor.request_book_depth(id, None, None, None, None, None, params),
+            Self::Book => actor.request_book_snapshot(id, None, None, params),
+            Self::FundingRate => actor.request_funding_rates(id, None, None, None, None, params),
+            Self::Data => {
+                let client_id = ClientId::new("HISTORY");
+                actor.request_data(warmup_data_type(), client_id, None, None, None, params)
+            }
+        }
+        .unwrap()
+    }
+
+    fn publish(self, ts: u64) {
+        let id = audusd_sim().id;
+
+        match self {
+            Self::Quote => msgbus::publish_quote(get_quotes_topic(id), &warmup_quote(ts)),
+            Self::Trade => msgbus::publish_trade(get_trades_topic(id), &warmup_trade(ts)),
+            Self::Bar => msgbus::publish_bar(get_bars_topic(warmup_bar_type()), &warmup_bar(ts)),
+            Self::BookDeltas => {
+                let deltas = OrderBookDeltas::new(id, vec![warmup_delta(ts)]);
+                msgbus::publish_deltas(get_book_deltas_topic(id), &deltas);
+            }
+            Self::BookDepth => msgbus::publish_depth(get_book_depth_topic(id), &warmup_depth(ts)),
+            Self::Book => {
+                let interval = NonZeroUsize::new(BOOK_INTERVAL_MS).unwrap();
+                msgbus::publish_book(get_book_snapshots_topic(id, interval), &warmup_book(ts));
+            }
+            Self::FundingRate => {
+                let topic = get_funding_rate_topic(id);
+                msgbus::publish_funding_rate(topic, &warmup_funding_rate(ts));
+            }
+            Self::Data => {
+                msgbus::publish_any(get_custom_topic(&warmup_data_type()), &warmup_custom(ts));
+            }
+        }
+    }
+
+    /// Returns a response delivering `ts`; a book snapshot delivers one book updated at the last.
+    fn response(self, request_id: UUID4, ts: &[u64]) -> DataResponse {
+        let client_id = ClientId::new("HISTORY");
+        let id = audusd_sim().id;
+        let ts_init = UnixNanos::from(1_000_000);
+
+        match self {
+            Self::Quote => DataResponse::Quotes(QuotesResponse::new(
+                request_id,
+                client_id,
+                id,
+                items(ts, warmup_quote),
+                None,
+                None,
+                ts_init,
+                None,
+            )),
+            Self::Trade => DataResponse::Trades(TradesResponse::new(
+                request_id,
+                client_id,
+                id,
+                items(ts, warmup_trade),
+                None,
+                None,
+                ts_init,
+                None,
+            )),
+            Self::Bar => DataResponse::Bars(BarsResponse::new(
+                request_id,
+                client_id,
+                warmup_bar_type(),
+                items(ts, warmup_bar),
+                None,
+                None,
+                ts_init,
+                None,
+            )),
+            Self::BookDeltas => DataResponse::BookDeltas(BookDeltasResponse::new(
+                request_id,
+                client_id,
+                id,
+                items(ts, warmup_delta),
+                None,
+                None,
+                ts_init,
+                None,
+            )),
+            Self::BookDepth => DataResponse::BookDepth(BookDepthResponse::new(
+                request_id,
+                client_id,
+                id,
+                items(ts, warmup_depth),
+                None,
+                None,
+                ts_init,
+                None,
+            )),
+            Self::Book => DataResponse::Book(BookResponse::new(
+                request_id,
+                client_id,
+                id,
+                warmup_book(*ts.last().unwrap()),
+                None,
+                None,
+                ts_init,
+                None,
+            )),
+            Self::FundingRate => DataResponse::FundingRates(FundingRatesResponse::new(
+                request_id,
+                client_id,
+                id,
+                items(ts, warmup_funding_rate),
+                None,
+                None,
+                ts_init,
+                None,
+            )),
+            Self::Data => DataResponse::Data(CustomDataResponse::new(
+                request_id,
+                client_id,
+                None,
+                warmup_data_type(),
+                items(ts, warmup_custom),
+                None,
+                None,
+                ts_init,
+                None,
+            )),
+        }
+    }
+
+    /// Returns the callbacks a response delivering `ts` drives.
+    fn historical(self, ts: &[u64]) -> Vec<Delivery> {
+        let kind = self.name();
+
+        match self {
+            Self::Quote | Self::Trade | Self::Bar => {
+                let mut expected: Vec<_> =
+                    ts.iter().map(|t| Delivery::Indicator(kind, *t)).collect();
+                expected.push(Delivery::Historical(kind, ts.to_vec()));
+                expected
+            }
+            Self::Book => vec![Delivery::Handler(kind, *ts.last().unwrap())],
+            _ => vec![Delivery::Historical(kind, ts.to_vec())],
+        }
+    }
+
+    /// Returns the callbacks a live item at `ts` drives.
+    fn live(self, ts: u64) -> Vec<Delivery> {
+        let kind = self.name();
+
+        match self {
+            Self::Quote | Self::Trade | Self::Bar => {
+                vec![Delivery::Indicator(kind, ts), Delivery::Handler(kind, ts)]
+            }
+            _ => vec![Delivery::Handler(kind, ts)],
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Quote => "quote",
+            Self::Trade => "trade",
+            Self::Bar => "bar",
+            Self::BookDeltas => "deltas",
+            Self::BookDepth => "depth",
+            Self::Book => "book",
+            Self::FundingRate => "funding",
+            Self::Data => "data",
+        }
+    }
+}
+
+/// Starts an actor with a recording indicator, subscribes `kind` and requests it with `params`.
+fn warm_up(
+    kind: WarmupKind,
+    params: Option<Params>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) -> (Ustr, DeliveryLog, UUID4) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let log = Rc::clone(&actor.deliveries);
+    let indicator = Rc::new(RecordingIndicator {
+        log: Rc::clone(&log),
+    });
+    let id = audusd_sim().id;
+    actor
+        .core
+        .register_indicator_for_quote_ticks(id, Rc::clone(&indicator) as _);
+    actor
+        .core
+        .register_indicator_for_trade_ticks(id, Rc::clone(&indicator) as _);
+    actor
+        .core
+        .register_indicator_for_bars(warmup_bar_type(), indicator);
+    kind.subscribe(&mut actor);
+    let request_id = kind.request(&mut actor, params);
+    (actor_id, log, request_id)
+}
+
+fn items<T>(ts: &[u64], item: fn(u64) -> T) -> Vec<T> {
+    ts.iter().map(|ts| item(*ts)).collect()
+}
+
+fn send_window(kind: WarmupKind, request_id: UUID4, ts: &[u64], completed: bool) {
+    let envelope = DataResponseEnvelope::new(kind.response(request_id, ts), completed, None);
+    msgbus::send_response_envelope(&envelope);
+}
+
+fn response_hook(completed: bool, failure: Option<&str>) -> Delivery {
+    Delivery::Response {
+        completed,
+        failure: failure.map(str::to_owned),
+    }
+}
+
+#[rstest]
+#[case::quote(WarmupKind::Quote)]
+#[case::trade(WarmupKind::Trade)]
+#[case::bar(WarmupKind::Bar)]
+#[case::book_deltas(WarmupKind::BookDeltas)]
+#[case::book_depth(WarmupKind::BookDepth)]
+#[case::book(WarmupKind::Book)]
+#[case::funding_rate(WarmupKind::FundingRate)]
+#[case::data(WarmupKind::Data)]
+fn test_live_data_arriving_during_request(
+    #[case] kind: WarmupKind,
+    #[values(true, false)] update: bool,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let params = update.then(update_subscriptions);
+    let (_, log, request_id) = warm_up(kind, params, clock, cache, trader_id);
+
+    kind.publish(30);
+    send_window(kind, request_id, &[10, 20], true);
+
+    let (history, live) = (kind.historical(&[10, 20]), kind.live(30));
+    let mut expected = if update {
+        [history, live].concat()
+    } else {
+        [live, history].concat()
+    };
+    expected.push(response_hook(true, None));
+    assert_eq!(*log.borrow(), expected);
+}
+
+#[rstest]
+fn test_book_snapshot_request_holds_live_deltas_and_depth(
+    #[values(true, false)] update: bool,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let (book, deltas, depth) = (
+        WarmupKind::Book,
+        WarmupKind::BookDeltas,
+        WarmupKind::BookDepth,
+    );
+    let params = update.then(update_subscriptions);
+    let (actor_id, log, request_id) = warm_up(book, params, clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    deltas.subscribe(&mut actor);
+    depth.subscribe(&mut actor);
+    drop(actor);
+
+    depth.publish(30);
+    deltas.publish(40);
+    send_window(book, request_id, &[20], true);
+
+    let (history, live) = (
+        book.historical(&[20]),
+        [depth.live(30), deltas.live(40)].concat(),
+    );
+    let mut expected = if update {
+        [history, live].concat()
+    } else {
+        [live, history].concat()
+    };
+    expected.push(response_hook(true, None));
+    assert_eq!(*log.borrow(), expected);
+}
+
+#[rstest]
+#[case::success(None)]
+#[case::failure(Some("venue failed"))]
+fn test_update_subscriptions_release_follows_final_payload_and_precedes_completion(
+    #[case] failure: Option<&str>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let kind = WarmupKind::Quote;
+    let (_, log, request_id) = warm_up(kind, Some(update_subscriptions()), clock, cache, trader_id);
+
+    kind.publish(30);
+    send_window(kind, request_id, &[10], false);
+    kind.publish(40);
+    let last = DataResponseEnvelope::new(kind.response(request_id, &[20]), true, None);
+    let last = match failure {
+        Some(reason) => last.with_failure(reason.to_owned()),
+        None => last,
+    };
+    msgbus::send_response_envelope(&last);
+
+    let mut expected = kind.historical(&[10]);
+    expected.push(response_hook(false, None));
+    expected.extend(kind.historical(&[20]));
+    expected.extend(kind.live(30));
+    expected.extend(kind.live(40));
+    expected.push(response_hook(true, failure));
+    assert_eq!(*log.borrow(), expected);
+}
+
+#[rstest]
+fn test_reset_discards_held_live_data(
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let kind = WarmupKind::Quote;
+    let (actor_id, log, discarded) =
+        warm_up(kind, Some(update_subscriptions()), clock, cache, trader_id);
+
+    kind.publish(30);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.stop().unwrap();
+    actor.reset().unwrap();
+    actor.start().unwrap();
+    kind.subscribe(&mut actor);
+    let request_id = kind.request(&mut actor, Some(update_subscriptions()));
+    drop(actor);
+    send_window(kind, discarded, &[10], true);
+    kind.publish(50);
+    send_window(kind, request_id, &[20], true);
+
+    let mut expected = kind.historical(&[20]);
+    expected.extend(kind.live(50));
+    expected.push(response_hook(true, None));
+    assert_eq!(*log.borrow(), expected);
+}
+
+#[rstest]
+fn test_update_subscriptions_hold_releases_at_cap_and_passes_until_complete(
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let kind = WarmupKind::Quote;
+    let (_, log, request_id) = warm_up(kind, Some(update_subscriptions()), clock, cache, trader_id);
+    let live: Vec<u64> = (100..=101 + MAX_HELD as u64).collect();
+
+    for ts in &live[..MAX_HELD] {
+        kind.publish(*ts);
+    }
+    let delivered_at_cap = log.borrow().len();
+    kind.publish(live[MAX_HELD]);
+    kind.publish(live[MAX_HELD + 1]);
+    send_window(kind, request_id, &[10], true);
+
+    let mut expected: Vec<_> = live.iter().flat_map(|ts| kind.live(*ts)).collect();
+    expected.extend(kind.historical(&[10]));
+    expected.push(response_hook(true, None));
+    let log = log.borrow();
+    let first_difference = log.iter().zip(&expected).position(|(a, e)| a != e);
+    assert_eq!(delivered_at_cap, 0);
+    assert_eq!((first_difference, log.len()), (None, expected.len()));
 }

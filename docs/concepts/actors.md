@@ -554,6 +554,47 @@ grouping until actor request cleanup; payload batches are not retained for group
 or disposal, fault, and `release_subscriptions` clear this state and discard unfinished groups without
 completion events. Python `request_join` uses the same lifecycle.
 
+### Warm up live subscriptions
+
+A live item can arrive before the response of a request for the same data, so indicators and handlers
+would read it before older history. Set `"update_subscriptions": True` in a request's params to hold the
+actor's live data of the requested series until the request completes:
+
+```python
+from datetime import timedelta
+
+
+def on_start(self) -> None:
+    self.register_indicator_for_quote_ticks(self.instrument_id, self.ema)
+    self.subscribe_quotes(self.instrument_id)
+
+    start = self.clock.utc_now() - timedelta(days=30)
+
+    # The EMA and on_quote read the response first, then the quotes held meanwhile
+    self.request_quotes(self.instrument_id, start=start, params={"update_subscriptions": True})
+```
+
+- **Series**: Quotes, trades, funding rates, book deltas, and book depth hold per instrument, bars per
+  standard bar type, and custom data per `DataType`. A request naming several instruments holds each one.
+  `request_book_snapshot` holds the instrument's deltas, depth, and book snapshots. A request that
+  aggregates bars through `"bar_types"` holds the actor's own live data of the type it requests, such
+  as its trades, as any request with the key does.
+- **Release**: The terminal envelope releases the held items in arrival order, whether the request
+  succeeded or failed. They follow the typed payload hook and precede `on_data_response`. Each item takes
+  the live path: registered indicators, then its handler. Intermediate `time_range_generator` windows keep
+  holding, and overlapping requests on one series hold it until the last completes. The hold relies on
+  the request ending, in success or failure: a request that never ends holds its series until a limit
+  or cleanup releases it.
+- **Cleanup**: Successful reset or disposal, `fault()`, and `release_subscriptions` discard held items
+  with the pending requests.
+- **Limit**: A series holds at most 65,536 items or 64 MiB of known storage: each item's slot and the
+  book levels, deltas, depth, and data type it owns. An item past either limit makes the actor log a
+  warning, release the held items in arrival order, and deliver the series on arrival until its
+  requests complete.
+
+Requests without the key and instrument requests do not hold live data. Data the actor publishes to
+itself, such as with `publish_data`, is live data of its series too.
+
 ### Subscription lists
 
 Actor and Strategy subscriptions accept one identifier or a non-empty collection. The matching

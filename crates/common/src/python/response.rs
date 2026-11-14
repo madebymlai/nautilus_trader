@@ -33,7 +33,10 @@ use pyo3::{
 use ustr::Ustr;
 
 use crate::{
-    actor::{DataActor, DataActorNative, ResponseScope, registry::try_get_actor_unchecked},
+    actor::{
+        DataActor, DataActorNative, ResponseScope, data_actor::release_warmup,
+        registry::try_get_actor_unchecked,
+    },
     messages::data::{DataResponse, DataResponseEnvelope},
     msgbus::TypedHandler,
     python::logging::format_exception,
@@ -163,6 +166,10 @@ where
                 .is_some_and(|actor| actor.core().complete_request(envelope, &scope));
 
             if current {
+                if let Some(mut actor) = try_get_actor_unchecked::<T>(&actor_id) {
+                    release_warmup(&mut *actor);
+                }
+
                 dispatch_completion(py, instance.as_ref(), wrapper);
                 dispatch_callback::<T>(actor_id, &scope, envelope, callback.as_ref());
             }
