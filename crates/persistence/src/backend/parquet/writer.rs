@@ -2717,7 +2717,7 @@ mod tests {
         writer.core.write_data(Data::Bar(next)).unwrap();
         let work = writer.prepare_promotion().unwrap().unwrap();
         let files = work.files().to_vec();
-        let error = writer.finalize(work.execute()).unwrap_err();
+        let promoted = writer.finalize(work.execute()).unwrap();
         let mut catalog = ParquetDataCatalog::new(directory.path(), None, None, None, None);
 
         let DataBatch::Bar(rows) = catalog
@@ -2736,7 +2736,9 @@ mod tests {
             first
         };
 
-        assert!(error.to_string().contains("non-disjoint intervals"));
+        let staged = directory.path().join(&files[0]);
+
+        assert!(promoted.is_empty());
         assert_eq!(rows.as_ref(), &[expected]);
         assert_eq!(
             catalog
@@ -2746,7 +2748,9 @@ mod tests {
             1
         );
         assert_eq!(files.len(), 1);
-        assert!(directory.path().join(&files[0]).exists());
+        assert!(!staged.exists());
+        assert!(staged.with_extension("feather.rejected").exists());
+        assert!(writer.prepare_promotion().unwrap().is_none());
     }
 
     #[rstest]
@@ -3065,6 +3069,80 @@ mod tests {
             panic!("expected quotes")
         };
         assert_eq!(rows.as_ref(), &[quote]);
+    }
+
+    // A run left quotes at 20 and 30 staged, then a historical request wrote quotes at 10 and 40
+    // to the catalog before the restarted writer's first promotion
+    #[rstest]
+    fn promotion_sets_aside_staged_file_overlapping_catalog() {
+        let directory = TempDir::new().unwrap();
+        let staging = directory.path().join("live/run-overlap");
+        let mut crashed = FeatherWriter::new(
+            staging.clone(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            None,
+        );
+        crashed.write(quote_at(20)).unwrap();
+        crashed.write(quote_at(30)).unwrap();
+        crashed.close().unwrap();
+        let staged = staging.join("quotes/quotes_0.feather");
+        let staged_bytes = fs::read(&staged).unwrap();
+        let mut catalog = ParquetDataCatalog::new(directory.path(), None, None, None, None);
+        catalog
+            .write_to_parquet(&[quote_at(10), quote_at(40)], None, None, None)
+            .unwrap();
+        let mut config =
+            WriterConnectConfig::new(staging.to_string_lossy(), Some(local_catalog(&directory)));
+        config.delete_feather_after_promotion = true;
+        let mut writer =
+            ParquetWriter::new(&config, WriterClock::Test(Arc::new(AtomicU64::new(1)))).unwrap();
+        writer.core.write_data(Data::Quote(quote_at(50))).unwrap();
+
+        let promoted = writer.promote_now().unwrap();
+        writer.core.write_data(Data::Quote(quote_at(60))).unwrap();
+        StreamingSink::close(&mut writer).unwrap();
+        drop(writer);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(staging.join(RUN_MANIFEST_FILENAME)).unwrap())
+                .unwrap();
+        let restarted =
+            ParquetWriter::new(&config, WriterClock::Test(Arc::new(AtomicU64::new(2)))).unwrap();
+
+        let DataBatch::Quote(rows) = catalog
+            .query_batch(&CatalogQuery::new(NautilusDataType::QuoteTick))
+            .unwrap()
+        else {
+            panic!("expected quotes")
+        };
+
+        assert_eq!(
+            promoted
+                .iter()
+                .map(|summary| summary.feather_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["live/run-overlap/quotes/quotes_1.feather"]
+        );
+        assert_eq!(manifest["status"], "promoted");
+        assert!(restarted.prepare_promotion().unwrap().is_none());
+        assert!(!staged.exists());
+        assert_eq!(
+            fs::read(staged.with_extension("feather.rejected")).unwrap(),
+            staged_bytes
+        );
+        assert_eq!(
+            rows.as_ref(),
+            &[quote_at(10), quote_at(40), quote_at(50), quote_at(60)]
+        );
+    }
+
+    fn quote_at(ts_init: u64) -> QuoteTick {
+        QuoteTick {
+            ts_event: UnixNanos::from(ts_init),
+            ts_init: UnixNanos::from(ts_init),
+            ..sample_quote()
+        }
     }
 
     #[rstest]

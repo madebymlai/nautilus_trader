@@ -75,12 +75,13 @@ not later than the open file's latest row stays in that file whatever rotation i
 written in one batch share one decision, so rotation never splits rows with the same `ts_init`.
 This holds only while each staged type's `ts_init` does not decrease, across all of its identifiers.
 Rotation compares a row with the open file alone, so a late row at or before a sealed file's last
-`ts_init` lands in a later file, which can then overlap the sealed file's interval and fail promotion.
+`ts_init` lands in a later file, which can then overlap the sealed file's interval, so promotion
+sets one of the two files aside.
 
 Interval-based promotion and explicit seals, such as the Rust `FeatherWriter::seal`, do not follow
 `ts_init`: they seal every open file when they run, so a row written afterward with the same
 `ts_init` as a sealed file's last row starts the next file. Unless the later rows are exact bar
-replays, promotion rejects the overlapping catalog interval and retains that source. Leave
+replays, promotion rejects the overlapping catalog interval and sets that source aside. Leave
 `promotion_interval_ms` unset when rows sharing a `ts_init` must stay in one file.
 
 ## Understand query visibility
@@ -131,6 +132,13 @@ run staged for later conversion through `ParquetDataCatalog.convert_stream_to_da
 run's `environment`, such as `Environment.LIVE`, to convert a run outside the default backtest
 folder.
 
+Promotion sets aside a staged file whose rows overlap intervals already in the catalog, since
+retrying cannot promote it: it renames the file to `.feather.rejected`, which promotion and run
+reads skip, logs the overlapping catalog intervals as an error, and promotes the run's other files.
+Delete the file to keep the catalog data, or remove the overlapping catalog data and rename the file
+back to `.feather` so the next writer on the run folder or
+`ParquetDataCatalog.convert_stream_to_data()` promotes it.
+
 A writer holds an exclusive lock on each `.feather.partial` file until it seals the file, so a
 crashed process leaves its open files unlocked. Recovery seals each unlocked regular partial file: it keeps
 the complete record batches, drops any bytes after them with a warning, and renames the file to
@@ -170,7 +178,7 @@ removes rows that exactly match all persisted rows at the same `ts_init`, includ
 metadata, OHLCV, and `ts_event`. With `use_ts_event_for_ts_init=True`, `ts_init` is replaced with
 `ts_event` before this comparison. The same OHLCV at a different `ts_init` is not a replay; promotion
 still requires disjoint intervals. A differing bar at the same `ts_init` fails the interval check,
-and its Feather source is retained.
+and its Feather source is set aside.
 
 Before writing one Feather file, promotion unifies groups whose precision metadata differs only by a zero precision and
 whose zero-precision group has no decimal values. Promotion writes one file for the combined interval

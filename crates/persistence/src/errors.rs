@@ -43,6 +43,17 @@ pub enum PersistenceError {
     /// The operation is not supported by this concrete backend.
     #[error("Operation not supported by this backend: {0}")]
     Unsupported(String),
+    /// Promoted rows overlap `ts_init` intervals already in a catalog directory.
+    #[error(
+        "Writing promoted groups for {directory} would create non-disjoint intervals. \
+         Overlapping catalog intervals: {intervals:?}"
+    )]
+    CatalogOverlap {
+        /// The catalog directory the rows belong to.
+        directory: String,
+        /// The directory's closed `ts_init` intervals that the rows overlap.
+        intervals: Vec<(u64, u64)>,
+    },
 }
 
 impl PersistenceError {

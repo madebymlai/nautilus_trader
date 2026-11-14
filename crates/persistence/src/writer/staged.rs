@@ -714,13 +714,16 @@ mod tests {
     use super::*;
     use crate::{
         common::storage::create_storage_backend_from_path,
+        errors::PersistenceError,
         writer::promotion::{PromotionBackend, tests::assert_scheduled_count},
     };
 
+    // Fails the first conversion once, and refuses `overlapping` as overlapping the catalog
     #[derive(Clone)]
     struct RecordingBackend {
         files: Sender<String>,
         fail: bool,
+        overlapping: Option<String>,
     }
 
     impl PromotionBackend for RecordingBackend {
@@ -739,6 +742,14 @@ mod tests {
             if self.fail {
                 self.fail = false;
                 anyhow::bail!("conversion failed");
+            }
+
+            if self.overlapping.as_deref() == Some(file) {
+                return Err(PersistenceError::CatalogOverlap {
+                    directory: "data/quotes/AUDUSD.SIM".to_string(),
+                    intervals: vec![(1, 2)],
+                }
+                .into());
             }
 
             Ok(Some(FeatherConversionSummary {
@@ -786,6 +797,7 @@ mod tests {
         let backend = RecordingBackend {
             files: files_tx,
             fail: false,
+            overlapping: None,
         };
         let attempts = Arc::new(AtomicU64::new(0));
         let factory_attempts = Arc::clone(&attempts);
@@ -923,6 +935,7 @@ mod tests {
         let backend = RecordingBackend {
             files: files_tx,
             fail: true,
+            overlapping: None,
         };
 
         let work = writer
@@ -967,6 +980,56 @@ mod tests {
             files_rx.try_iter().collect::<Vec<_>>(),
             vec![files[0].clone(), files[1].clone(), files[0].clone()]
         );
+    }
+
+    #[rstest]
+    fn overlapping_file_is_set_aside_while_failed_file_stays_queued() {
+        let directory = TempDir::new().unwrap();
+        let root =
+            create_storage_backend_from_path(directory.path().to_str().unwrap(), None).unwrap();
+        let source = FeatherSessionSource::new(root, Environment::Backtest, "run-overlap");
+        let staging = directory.path().join("backtest/run-overlap");
+        let storage = create_storage_backend_from_path(staging.to_str().unwrap(), None).unwrap();
+        let mut writer = StagedFeatherWriter::<RecordingBackend>::new(
+            storage,
+            &source,
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::Size { max_size: 1 },
+            None,
+            Some(0),
+            None,
+        )
+        .unwrap();
+        writer.write_data(Data::Quote(quote_at(1))).unwrap();
+        writer.write_data(Data::Quote(quote_at(2))).unwrap();
+        let (files_tx, _files_rx) = mpsc::channel();
+        let backend = RecordingBackend {
+            files: files_tx,
+            fail: true,
+            overlapping: Some("backtest/run-overlap/quotes/quotes_0.feather".to_string()),
+        };
+
+        let work = writer
+            .prepare_promotion(|| Ok(backend.clone()), source.clone(), false, false)
+            .unwrap()
+            .unwrap();
+        let error = writer.finalize_promotion(work.execute()).unwrap_err();
+        let retry = writer
+            .prepare_promotion(|| Ok(backend), source, false, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "Recording promotion failed for Feather file \
+             'backtest/run-overlap/quotes/quotes_0-1.feather': conversion failed"
+        );
+        assert_eq!(
+            retry.files(),
+            &["backtest/run-overlap/quotes/quotes_0-1.feather"]
+        );
+        assert!(!staging.join("quotes/quotes_0.feather").exists());
+        assert!(staging.join("quotes/quotes_0.feather.rejected").exists());
     }
 
     #[rstest]
@@ -1049,6 +1112,7 @@ mod tests {
         let backend = RecordingBackend {
             files: files_tx,
             fail: false,
+            overlapping: None,
         };
 
         let work = writer

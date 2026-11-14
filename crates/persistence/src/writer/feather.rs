@@ -322,6 +322,10 @@ pub(crate) const FEATHER_EXTENSION: &str = "feather";
 /// File extension of a Feather stream file that is still being appended to.
 pub(crate) const FEATHER_PARTIAL_EXTENSION: &str = "feather.partial";
 
+/// File extension of a sealed Feather stream file that promotion set aside because its rows
+/// overlap intervals already in the catalog.
+pub(crate) const FEATHER_REJECTED_EXTENSION: &str = "feather.rejected";
+
 /// An open local Feather file that appends Arrow IPC stream batches.
 ///
 /// Batches go to `{name}.feather.partial`, which is renamed to `{name}.feather` when the file is
@@ -1169,7 +1173,10 @@ impl FeatherWriter {
             let path = self.build_writer_path(&data_type, timestamp, sequence);
 
             // Files left by an earlier writer in the same directory keep their names
-            if path.exists() || path.with_extension(FEATHER_PARTIAL_EXTENSION).exists() {
+            if path.exists()
+                || path.with_extension(FEATHER_PARTIAL_EXTENSION).exists()
+                || path.with_extension(FEATHER_REJECTED_EXTENSION).exists()
+            {
                 continue;
             }
 
@@ -2857,18 +2864,24 @@ mod tests {
             .path()
             .join("trades")
             .join("trades_5-1.feather.partial");
+        let rejected = temp_dir
+            .path()
+            .join("trades")
+            .join("trades_5-2.feather.rejected");
         fs::create_dir_all(sealed.parent().unwrap()).unwrap();
         fs::write(&sealed, b"sealed").unwrap();
         fs::write(&partial, b"partial").unwrap();
+        fs::write(&rejected, b"rejected").unwrap();
 
         let path = writer.reserve_writer_path(NautilusDataType::TradeTick.into());
 
         assert_eq!(
             path.path,
-            temp_dir.path().join("trades").join("trades_5-2.feather")
+            temp_dir.path().join("trades").join("trades_5-3.feather")
         );
         assert_eq!(fs::read(&sealed).unwrap(), b"sealed");
         assert_eq!(fs::read(&partial).unwrap(), b"partial");
+        assert_eq!(fs::read(&rejected).unwrap(), b"rejected");
     }
 
     #[rstest]

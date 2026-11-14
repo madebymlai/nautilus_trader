@@ -78,6 +78,7 @@ use crate::{
             identifier_from_session_feather_path,
         },
     },
+    errors::PersistenceError,
     writer::{
         feather::recover_partial_feather_files,
         materializer::{
@@ -913,6 +914,28 @@ impl ParquetDataCatalog {
             remaining = filtered;
         }
 
+        let overlapping = existing
+            .iter()
+            .filter(|&&(start, end)| {
+                remaining
+                    .iter()
+                    .any(|plan| plan.start_ts <= end && start <= plan.end_ts)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+
+        // Retrying cannot promote rows the catalog already covers, so the error is typed for the
+        // promotion to set the source aside
+        if !overlapping.is_empty() {
+            return Err(PersistenceError::CatalogOverlap {
+                directory: directory.to_string(),
+                intervals: overlapping,
+            }
+            .into());
+        }
+
+        // With no overlap left, this fails only when the catalog's own intervals overlap, which no
+        // staged file can fix
         let mut intervals = existing.clone();
         intervals.extend(remaining.iter().map(|plan| (plan.start_ts, plan.end_ts)));
 

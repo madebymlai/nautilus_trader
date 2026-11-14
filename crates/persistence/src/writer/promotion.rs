@@ -32,7 +32,7 @@ use ahash::AHashSet;
 use nautilus_common::{enums::Environment, live::block_on_nautilus_with};
 use nautilus_core::UnixNanos;
 use nautilus_model::data::Data;
-use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStoreExt, path::Path as ObjectPath};
 
 use crate::{
     common::{
@@ -40,7 +40,9 @@ use crate::{
         paths::{environment_directory, environment_from_directory, normalize_path_separators},
         storage::StorageBackend,
     },
+    errors::PersistenceError,
     writer::{
+        feather::{FEATHER_EXTENSION, FEATHER_REJECTED_EXTENSION},
         run::{FeatherSessionSource, RunStatus},
         traits::StreamingSink,
     },
@@ -242,6 +244,12 @@ pub(crate) trait PromotionBackend: Send + 'static {
 
     const NAME: &'static str;
 
+    /// Converts one staged Feather file into the catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the conversion fails. A [`PersistenceError::CatalogOverlap`] error
+    /// marks rows that retrying cannot promote, so the promotion sets the file aside instead.
     fn convert_file(
         &mut self,
         source: &Self::Source,
@@ -355,6 +363,7 @@ where
                 files,
                 committed_paths: Vec::new(),
                 deleted_paths: Vec::new(),
+                rejected_paths: Vec::new(),
                 partial_converted: Vec::new(),
                 run_state_recorded: false,
                 converted: Err(anyhow::anyhow!(
@@ -387,6 +396,7 @@ where
         let mut converted = Vec::new();
         let mut committed_paths = Vec::new();
         let mut deleted_paths = Vec::new();
+        let mut rejected_paths = Vec::new();
         let mut errors = Vec::new();
         let mut promoted_recorded = false;
         let mut record_error = None;
@@ -468,6 +478,29 @@ where
                     }
                 }
                 Ok(None) => {}
+                Err(e)
+                    if matches!(
+                        e.downcast_ref::<PersistenceError>(),
+                        Some(PersistenceError::CatalogOverlap { .. })
+                    ) =>
+                {
+                    match reject_feather_file(&self.source, file) {
+                        Ok(rejected) => {
+                            log::error!(
+                                "{} promotion set aside Feather file '{file}' as '{rejected}': \
+                                 {e}. Delete it to keep the catalog data, or remove the \
+                                 overlapping catalog data and rename it back to promote it",
+                                B::NAME,
+                            );
+                            rejected_paths.push(file.clone());
+                        }
+                        Err(reject_error) => errors.push(format!(
+                            "{} promotion failed for Feather file '{file}': {e}; setting it \
+                             aside failed: {reject_error:#}",
+                            B::NAME,
+                        )),
+                    }
+                }
                 Err(e) => {
                     let e = e.context(format!(
                         "{} promotion failed for Feather file '{file}'",
@@ -483,6 +516,7 @@ where
                 files: self.files,
                 committed_paths,
                 deleted_paths,
+                rejected_paths,
                 partial_converted: converted,
                 run_state_recorded: false,
                 converted: Err(
@@ -515,6 +549,7 @@ where
                 files: self.files,
                 committed_paths,
                 deleted_paths,
+                rejected_paths,
                 partial_converted: converted,
                 run_state_recorded,
                 converted: Err(anyhow::anyhow!(errors.join("; "))),
@@ -535,6 +570,7 @@ where
                 files: self.files,
                 committed_paths,
                 deleted_paths,
+                rejected_paths,
                 partial_converted: converted,
                 run_state_recorded: false,
                 converted: Err(
@@ -553,6 +589,7 @@ where
             files: self.files,
             committed_paths,
             deleted_paths,
+            rejected_paths,
             partial_converted: Vec::new(),
             run_state_recorded,
             converted: Ok(converted),
@@ -568,9 +605,29 @@ pub struct PromotionResult {
     pub(crate) files: Vec<String>,
     pub(crate) committed_paths: Vec<String>,
     pub(crate) deleted_paths: Vec<String>,
+    pub(crate) rejected_paths: Vec<String>,
     pub(crate) partial_converted: Vec<FeatherConversionSummary>,
     pub(crate) run_state_recorded: bool,
     pub(crate) converted: anyhow::Result<Vec<FeatherConversionSummary>>,
+}
+
+// Renames a staged file whose rows overlap the catalog out of the `.feather` listing, so neither
+// this writer nor a later one on the run folder retries it, and leaves its contents in place
+fn reject_feather_file(source: &FeatherSessionSource, file: &str) -> anyhow::Result<String> {
+    let rejected = format!(
+        "{}.{FEATHER_REJECTED_EXTENSION}",
+        file.strip_suffix(&format!(".{FEATHER_EXTENSION}"))
+            .unwrap_or(file),
+    );
+    let from = ObjectPath::parse(file)?;
+    let to = ObjectPath::parse(&rejected)?;
+
+    block_on_nautilus_with(|| async {
+        source.storage.object_store.rename(&from, &to).await?;
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    Ok(rejected)
 }
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -901,6 +958,7 @@ impl PromotionSchedule {
             .committed_paths
             .iter()
             .chain(&result.deleted_paths)
+            .chain(&result.rejected_paths)
             .collect::<AHashSet<_>>();
 
         for file in &result.files {
