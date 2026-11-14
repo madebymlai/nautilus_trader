@@ -600,6 +600,48 @@ than `Clear`. The engine checks the deltas after start snapshot replay.
   one event ahead of a snapshot, at request completion, or when a payload leaves 10,000 or more
   open deltas. The engine logs a warning each time. The size limit applies only during this fallback.
 
+### Warm up live subscriptions
+
+A live item can arrive before the response of a request for the same data, so indicators and handlers
+would read it before older history. Set `"update_subscriptions": True` in a request's params to hold the
+actor's live data of the requested series until the request completes:
+
+```python
+from datetime import timedelta
+
+
+def on_start(self) -> None:
+    self.register_indicator_for_quotes(self.instrument_id, self.ema)
+    self.subscribe_quotes(self.instrument_id)
+
+    start = self.clock.utc_now() - timedelta(days=30)
+
+    # The EMA reads the response before the quotes held meanwhile
+    self.request_quotes(self.instrument_id, start=start, params={"update_subscriptions": True})
+```
+
+- **Series**: Quotes, trades, funding rates, book deltas, and book depth hold per instrument, bars per
+  bar type, and custom data per `DataType`. A request naming several instruments holds each one. A
+  request that aggregates bars through `"bar_types"` holds the data it requests, such as trades, not
+  the bars it aggregates.
+- **Release**: The terminal envelope releases the held items in arrival order, whether the request
+  succeeded or failed. They follow the typed payload hook and precede `on_data_response`. Each item takes
+  the live path: registered indicators, then its handler. Overlapping requests on one series hold it
+  until the last completes. A response that overlaps the held items, such as one without an `end`,
+  delivers those items again. A request that never completes holds its series until a limit or cleanup
+  releases it.
+- **Cleanup**: Successful reset or disposal, `fault()`, and `release_subscriptions` discard held items
+  with the pending requests. Cleanup from a released handler also suppresses `on_data_response`. An
+  actor that is not running holds nothing.
+- **Limit**: An actor holds at most 65,536 items or 64 MiB across its series, counting the book data
+  each item owns. An item past either limit makes the actor log a warning, release every held item in
+  arrival order, and deliver those series on arrival until their requests complete. A request sent
+  afterwards holds again.
+
+Requests without the key, instrument requests, and `request_book_snapshot` do not hold live data: a
+snapshot already contains the updates before it. Data the actor publishes to
+itself, such as with `publish_data`, is live data of its series too.
+
 ### Subscription lists
 
 Actor and Strategy subscriptions accept one identifier or a non-empty collection. The matching

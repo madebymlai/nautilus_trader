@@ -36,6 +36,7 @@ mod dispatch;
 mod invocation;
 mod requests;
 mod storage;
+mod warmup;
 
 #[cfg(test)]
 pub(crate) mod tests;

@@ -30,8 +30,8 @@ use std::{
 
 use ahash::AHashMap;
 
-const MAX_PENDING: usize = 65_536;
-const MAX_KNOWN_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const MAX_PENDING: usize = 65_536;
+pub(super) const MAX_KNOWN_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CHAIN: usize = 1_048_576;
 const CHAIN_BYTES: usize = size_of::<Chain>() + 2 * size_of::<usize>();
 
