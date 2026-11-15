@@ -154,6 +154,7 @@ pub mod signal;
 pub mod testing;
 pub mod throttler;
 pub mod timer;
+pub mod warmup;
 pub mod xrate;
 
 mod macros;

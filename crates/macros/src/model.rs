@@ -368,6 +368,11 @@ fn gen_model_impls(ctx: &ExpansionContext<'_>) -> TokenStream {
     let name = ctx.name;
     let name_str = ctx.name_str;
     let generics = ctx.generics;
+    let compared = ctx
+        .fields
+        .iter()
+        .map(|field| &field.ident)
+        .filter(|ident| *ident != "ts_init");
     let to_pyobject = ctx.options.pyo3.then(|| {
         quote! {
             #[cfg(feature = "python")]
@@ -410,6 +415,13 @@ fn gen_model_impls(ctx: &ExpansionContext<'_>) -> TokenStream {
 
             fn eq_arc(&self, other: &dyn nautilus_model::data::CustomDataTrait) -> bool {
                 other.as_any().downcast_ref::<Self>().is_some_and(|other| self == other)
+            }
+
+            fn eq_ignore_ts_init(&self, other: &dyn nautilus_model::data::CustomDataTrait) -> bool {
+                other
+                    .as_any()
+                    .downcast_ref::<Self>()
+                    .is_some_and(|other| #(self.#compared == other.#compared)&&*)
             }
 
             fn from_json(value: serde_json::Value) -> anyhow::Result<std::sync::Arc<dyn nautilus_model::data::CustomDataTrait>> {

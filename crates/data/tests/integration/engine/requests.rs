@@ -2018,6 +2018,223 @@ fn test_update_subscriptions_request_aggregator_replays_live_trades_after_respon
     assert_eq!(messages[0].ts_event, UnixNanos::from(6_000));
 }
 
+/// The live data a bar aggregator warmed by an `update_subscriptions` request holds.
+#[derive(Clone, Copy, Debug)]
+enum WarmupSource {
+    Trade,
+    Quote,
+    Bar,
+}
+
+/// `at_end` prices the live item at the response's last `ts_event`, and `last_bar` is the newest
+/// bar aggregated as (open, close, `ts_event`).
+#[rstest]
+#[case::trade(WarmupSource::Trade, "0.65010", ("0.67000", "0.67010", 8_000))]
+#[case::quote(WarmupSource::Quote, "0.65010", ("0.67000", "0.67010", 8_000))]
+#[case::bar(WarmupSource::Bar, "0.65010", ("0.67000", "0.67010", 8_000))]
+#[case::bar_confirmed(WarmupSource::Bar, "0.65020", ("0.65020", "0.67000", 7_000))]
+fn test_update_subscriptions_request_aggregator_drops_held_data_the_response_replayed(
+    #[case] source: WarmupSource,
+    #[case] at_end: &str,
+    #[case] last_bar: (&str, &str, u64),
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+
+    let instrument_id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        test_clock,
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    let spec = match source {
+        WarmupSource::Trade => "2-TICK-LAST-INTERNAL",
+        WarmupSource::Quote => "2-TICK-BID-INTERNAL",
+        WarmupSource::Bar => "2-TICK-LAST-INTERNAL@1-MINUTE-EXTERNAL",
+    };
+    let bar_type = BarType::from(format!("{instrument_id}-{spec}").as_str());
+    let source_bar_type = bar_type.composite();
+    let request_id = UUID4::new();
+    let params: Params = serde_json::from_value(json!({
+        "bar_types": [bar_type.to_string()],
+        "update_subscriptions": true,
+    }))
+    .unwrap();
+
+    let request = match source {
+        WarmupSource::Trade => RequestCommand::Trades(RequestTrades::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            Some(params.clone()),
+        )),
+        WarmupSource::Quote => RequestCommand::Quotes(RequestQuotes::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            Some(params.clone()),
+        )),
+        WarmupSource::Bar => RequestCommand::Bars(RequestBars::new(
+            source_bar_type,
+            None,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            Some(params.clone()),
+        )),
+    };
+    data_engine.execute(DataCommand::Request(request));
+    data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+        SubscribeBars::new(
+            bar_type,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ),
+    )));
+
+    // A live copy's `ts_init` is its arrival, so only `ts_event` matches it to the response
+    let trade = |ts_event: u64, ts_init: u64, price: &str| {
+        TradeTick::new(
+            instrument_id,
+            Price::from(price),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(format!("T-{ts_event}")),
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_init),
+        )
+    };
+    let quote = |ts_event: u64, ts_init: u64, bid: &str| {
+        QuoteTick::new(
+            instrument_id,
+            Price::from(bid),
+            Price::from("0.70000"),
+            Quantity::from("1000"),
+            Quantity::from("1000"),
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_init),
+        )
+    };
+    let bar = |ts_event: u64, ts_init: u64, price: &str| {
+        let price = Price::from(price);
+        let volume = Quantity::from("1000");
+        let (ts_event, ts_init) = (UnixNanos::from(ts_event), UnixNanos::from(ts_init));
+        Bar::new(
+            source_bar_type,
+            price,
+            price,
+            price,
+            price,
+            volume,
+            ts_event,
+            ts_init,
+        )
+    };
+    let live = |ts_event: u64, ts_init: u64, price: &str| match source {
+        WarmupSource::Trade => Data::Trade(trade(ts_event, ts_init, price)),
+        WarmupSource::Quote => Data::Quote(quote(ts_event, ts_init, price)),
+        WarmupSource::Bar => Data::Bar(bar(ts_event, ts_init, price)),
+    };
+    let history = [(1_000, "0.65000"), (2_000, "0.65010")];
+    let ts_init = UnixNanos::from(7_000);
+    let response = match source {
+        WarmupSource::Trade => DataResponse::Trades(TradesResponse::new(
+            request_id,
+            client_id,
+            instrument_id,
+            history.map(|(ts, price)| trade(ts, ts, price)).to_vec(),
+            None,
+            None,
+            ts_init,
+            Some(params),
+        )),
+        WarmupSource::Quote => DataResponse::Quotes(QuotesResponse::new(
+            request_id,
+            client_id,
+            instrument_id,
+            history.map(|(ts, bid)| quote(ts, ts, bid)).to_vec(),
+            None,
+            None,
+            ts_init,
+            Some(params),
+        )),
+        WarmupSource::Bar => DataResponse::Bars(BarsResponse::new(
+            request_id,
+            client_id,
+            source_bar_type,
+            history.map(|(ts, price)| bar(ts, ts, price)).to_vec(),
+            None,
+            None,
+            ts_init,
+            Some(params),
+        )),
+    };
+
+    // An item from before the response's end, the venue's resend of its last item or the bar it
+    // confirms for that time, a new item
+    data_engine.process_data(live(1_500, 6_000, "0.64000"));
+    data_engine.process_data(live(2_000, 6_500, at_end));
+    data_engine.process_data(live(7_000, 7_000, "0.67000"));
+    data_engine.response(response);
+    data_engine.process_data(live(8_000, 8_000, "0.67010"));
+
+    let cache = cache.borrow();
+    let bars: Vec<_> = cache
+        .bars(&bar_type.standard())
+        .unwrap()
+        .iter()
+        .map(|bar| (bar.open, bar.close, bar.ts_event))
+        .collect();
+    let (open, close, ts_event) = last_bar;
+    assert_eq!(
+        bars,
+        [
+            (
+                Price::from(open),
+                Price::from(close),
+                UnixNanos::from(ts_event)
+            ),
+            (
+                Price::from("0.65000"),
+                Price::from("0.65010"),
+                UnixNanos::from(2_000)
+            ),
+        ]
+    );
+}
+
 #[rstest]
 #[case::composite_first(true)]
 #[case::source_first(false)]

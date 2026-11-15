@@ -585,12 +585,24 @@ def on_start(self) -> None:
   holding, and overlapping requests on one series hold it until the last completes. The hold relies on
   the request ending, in success or failure: a request that never ends holds its series until a limit
   or cleanup releases it.
+- **Drop**: A release drops the held items the responses already delivered. An item before the last
+  `ts_event` of its series that the responses delivered, across all windows, is dropped. One at that
+  `ts_event` is dropped only when it repeats a delivered item, such as a venue's resend of the response's
+  last item, so distinct items sharing a coarse timestamp are kept. Trades repeat by trade ID, quotes by
+  prices and sizes, bars by prices, volume, and standard bar type, book data by venue sequence or else
+  content, and funding rates by their fields. A request without an end can deliver a bar still forming
+  last: the bar the venue confirms for that time repeats it only with the same values, and otherwise
+  follows the history. Custom data repeats by `eq_ignore_ts_init`: `#[custom_data]` types compare every
+  field but `ts_init`, and other types, Python custom data included, compare `ts_event` and their own
+  equality. A book snapshot counts up to its last update: book data at that time with a sequence at or
+  below the snapshot's repeats it. `ts_init` is not compared, since each copy of an item records its own
+  arrival.
 - **Cleanup**: Successful reset or disposal, `fault()`, and `release_subscriptions` discard held items
   with the pending requests.
 - **Limit**: A series holds at most 65,536 items or 64 MiB of known storage: each item's slot and the
   book levels, deltas, depth, and data type it owns. An item past either limit makes the actor log a
-  warning, release the held items in arrival order, and deliver the series on arrival until its
-  requests complete.
+  warning, release the held items the responses have not yet delivered in arrival order, and deliver
+  the series on arrival until its requests complete.
 
 Requests without the key and instrument requests do not hold live data. Data the actor publishes to
 itself, such as with `publish_data`, is live data of its series too.

@@ -332,7 +332,11 @@ A live bar can arrive before the response. Pass `params={"update_subscriptions":
 `on_bar()` read the history first. See [Actors: warm up live subscriptions](../actors.md#warm-up-live-subscriptions).
 A request that aggregates bars through `"bar_types"` with the same key replays its history into the
 live aggregator before the updates held meanwhile. It also holds the requesting actor's own live data
-of the requested type, such as its trades, as any request with the key does.
+of the requested type, such as its trades, as any request with the key does. Both drop the live data
+the response already delivered: updates from before its last `ts_event`, and repeats of the items at
+that time. A live bar at that time repeats the response's bar only with the same prices and volume, so
+when a request without an end delivers a bar still forming last, the bar the venue confirms follows
+the history.
 
 The request returns a correlation ID. Historical data arrives through `on_historical_bars()` as a
 `Sequence[Bar]`. Live data arrives through `on_bar()` one bar at a time.

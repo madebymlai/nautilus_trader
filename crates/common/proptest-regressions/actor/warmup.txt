@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 95ef75dd67ee9b55db0f16fe94b1a5771b5ec4657005f8fc0b77c49040d275fb # shrinks to events = [Window([(19, 0)]), Live(19, 1)], last = []

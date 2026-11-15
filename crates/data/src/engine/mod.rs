@@ -103,6 +103,7 @@ use nautilus_common::{
     },
     runner::get_data_cmd_sender,
     timer::{TimeEvent, TimeEventCallback},
+    warmup::Delivered,
 };
 use nautilus_core::{
     DurationNanos, Params, UUID4, UnixNanos, WeakCell,
@@ -196,6 +197,7 @@ pub struct DataEngine {
     bar_aggregators: IndexMap<BarAggregatorKey, Rc<RefCell<Box<dyn BarAggregator>>>>,
     bar_aggregator_handlers: AHashMap<BarAggregatorKey, Vec<BarAggregatorSubscription>>,
     bar_aggregator_warmups: AHashMap<BarAggregatorKey, BarAggregatorWarmup>,
+    bar_aggregator_replayed: AHashMap<BarAggregatorKey, Delivered<Data>>,
     bar_aggregators_pending_stop: AHashSet<BarAggregatorKey>,
     subscriptions_bar_aggregation: AHashMap<BarType, BarAggregationSubscription>,
     request_bar_aggregations: AHashMap<UUID4, RequestBarAggregation>,
@@ -277,6 +279,7 @@ impl DataEngine {
             bar_aggregators: IndexMap::new(),
             bar_aggregator_handlers: AHashMap::new(),
             bar_aggregator_warmups: AHashMap::new(),
+            bar_aggregator_replayed: AHashMap::new(),
             bar_aggregators_pending_stop: AHashSet::new(),
             subscriptions_bar_aggregation: AHashMap::new(),
             request_bar_aggregations: AHashMap::new(),

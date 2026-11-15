@@ -9363,17 +9363,77 @@ fn test_live_data_arriving_during_request(
     let params = update.then(update_subscriptions);
     let (_, log, request_id) = warm_up(kind, params, clock, cache, trader_id);
 
-    kind.publish(30);
+    // An item from before the response's end, the venue's resend of its last item, a new item
+    for ts in [15, 20, 30] {
+        kind.publish(ts);
+    }
     send_window(kind, request_id, &[10, 20], true);
 
-    let (history, live) = (kind.historical(&[10, 20]), kind.live(30));
+    let history = kind.historical(&[10, 20]);
     let mut expected = if update {
-        [history, live].concat()
+        [history, kind.live(30)].concat()
     } else {
-        [live, history].concat()
+        [kind.live(15), kind.live(20), kind.live(30), history].concat()
     };
     expected.push(response_hook(true, None));
     assert_eq!(*log.borrow(), expected);
+}
+
+/// A bar request without an end can end on the bar still forming, whose confirmed bar arrives live
+/// while the request is pending.
+#[rstest]
+#[case::confirmed("102", "3", true)]
+#[case::resent("101", "2", false)]
+fn test_live_bar_at_the_last_historical_bar_time(
+    #[case] close: &str,
+    #[case] volume: &str,
+    #[case] delivered: bool,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let kind = WarmupKind::Bar;
+    let (actor_id, log, request_id) =
+        warm_up(kind, Some(update_subscriptions()), clock, cache, trader_id);
+    let bar = |close: &str, volume: &str, ts_init: u64| {
+        Bar::new(
+            warmup_bar_type(),
+            Price::from("100"),
+            Price::from("105"),
+            Price::from("99"),
+            Price::from(close),
+            Quantity::from(volume),
+            UnixNanos::from(20),
+            UnixNanos::from(ts_init),
+        )
+    };
+    let (partial, live) = (bar("101", "2", 1_020), bar(close, volume, 1_500));
+
+    msgbus::publish_bar(get_bars_topic(warmup_bar_type()), &live);
+    let response = BarsResponse::new(
+        request_id,
+        ClientId::new("HISTORY"),
+        warmup_bar_type(),
+        vec![warmup_bar(10), partial],
+        None,
+        None,
+        UnixNanos::from(1_000_000),
+        None,
+    );
+    let envelope = DataResponseEnvelope::new(DataResponse::Bars(response), true, None);
+    msgbus::send_response_envelope(&envelope);
+
+    let mut expected = kind.historical(&[10, 20]);
+    let mut received = vec![warmup_bar(10), partial];
+
+    if delivered {
+        expected.extend(kind.live(20));
+        received.push(live);
+    }
+    expected.push(response_hook(true, None));
+    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    assert_eq!(*log.borrow(), expected);
+    assert_eq!(actor.received_bars, received);
 }
 
 #[rstest]
@@ -9382,6 +9442,7 @@ fn test_book_snapshot_request_holds_live_deltas_and_depth(
     clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
+    audusd_sim: CurrencyPair,
 ) {
     let (book, deltas, depth) = (
         WarmupKind::Book,
@@ -9395,18 +9456,32 @@ fn test_book_snapshot_request_holds_live_deltas_and_depth(
     depth.subscribe(&mut actor);
     drop(actor);
 
+    // A delta from before the snapshot, one at its time that it holds by sequence, new data
+    deltas.publish(15);
+    deltas.publish(20);
     depth.publish(30);
     deltas.publish(40);
-    send_window(book, request_id, &[20], true);
-
-    let (history, live) = (
-        book.historical(&[20]),
-        [depth.live(30), deltas.live(40)].concat(),
+    let mut snapshot = warmup_book(20);
+    snapshot.sequence = 25;
+    let response = BookResponse::new(
+        request_id,
+        ClientId::new("HISTORY"),
+        audusd_sim.id,
+        snapshot,
+        None,
+        None,
+        UnixNanos::from(1_000_000),
+        None,
     );
+    let envelope = DataResponseEnvelope::new(DataResponse::Book(response), true, None);
+    msgbus::send_response_envelope(&envelope);
+
+    let history = book.historical(&[20]);
+    let new = [depth.live(30), deltas.live(40)].concat();
     let mut expected = if update {
-        [history, live].concat()
+        [history, new].concat()
     } else {
-        [live, history].concat()
+        [deltas.live(15), deltas.live(20), new, history].concat()
     };
     expected.push(response_hook(true, None));
     assert_eq!(*log.borrow(), expected);
@@ -9484,16 +9559,19 @@ fn test_update_subscriptions_hold_releases_at_cap_and_passes_until_complete(
     for ts in &live[..MAX_HELD] {
         kind.publish(*ts);
     }
+    send_window(kind, request_id, &[101], false);
     let delivered_at_cap = log.borrow().len();
     kind.publish(live[MAX_HELD]);
     kind.publish(live[MAX_HELD + 1]);
     send_window(kind, request_id, &[10], true);
 
-    let mut expected: Vec<_> = live.iter().flat_map(|ts| kind.live(*ts)).collect();
+    let mut expected = kind.historical(&[101]);
+    expected.push(response_hook(false, None));
+    expected.extend(live[2..].iter().flat_map(|ts| kind.live(*ts)));
     expected.extend(kind.historical(&[10]));
     expected.push(response_hook(true, None));
     let log = log.borrow();
     let first_difference = log.iter().zip(&expected).position(|(a, e)| a != e);
-    assert_eq!(delivered_at_cap, 0);
+    assert_eq!(delivered_at_cap, 3);
     assert_eq!((first_difference, log.len()), (None, expected.len()));
 }

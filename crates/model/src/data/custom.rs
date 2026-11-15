@@ -309,6 +309,16 @@ pub trait CustomDataTrait: HasTsInit + Send + Sync + Debug {
     /// Returns whether the custom data is equal to another.
     fn eq_arc(&self, other: &dyn CustomDataTrait) -> bool;
 
+    /// Returns whether the custom data is equal to another in every field but `ts_init`.
+    ///
+    /// Copies of one item received at different times differ only in `ts_init`. The default
+    /// requires an equal `ts_event` and [`Self::eq_arc`], so it ignores `ts_init` only where
+    /// `eq_arc` does, as Python equality does for a `@customdataclass`. `#[custom_data]` types
+    /// compare every other field.
+    fn eq_ignore_ts_init(&self, other: &dyn CustomDataTrait) -> bool {
+        self.ts_event() == other.ts_event() && self.eq_arc(other)
+    }
+
     /// Converts the custom data to a Python object.
     ///
     /// # Errors
@@ -517,12 +527,20 @@ impl Serialize for CustomData {
 #[cfg(test)]
 mod tests {
     use nautilus_core::{Params, UnixNanos};
+    #[cfg(feature = "python")]
+    use pyo3::{ffi::c_str, types::PyDict};
     use rstest::rstest;
     use serde::Deserialize;
     use serde_json::json;
 
     use super::*;
-    use crate::{data::HasTsInit, identifiers::InstrumentId};
+    use crate::{
+        data::{
+            HasTsInit,
+            stubs::{stub_custom_data, stub_remote_data},
+        },
+        identifiers::InstrumentId,
+    };
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     struct TestCustomData {
@@ -645,5 +663,58 @@ mod tests {
 
         assert_eq!(custom_data.data.ts_init(), UnixNanos::from(100));
         assert_eq!(Data::Custom(custom_data).instrument_id(), instrument_id);
+    }
+
+    #[rstest]
+    #[case::copy(stub_remote_data("1.00", 10, 99), true)]
+    #[case::other_ts_event(stub_remote_data("1.00", 20, 11), false)]
+    #[case::other_field(stub_remote_data("2.00", 10, 11), false)]
+    #[case::other_type(stub_custom_data(10, 0, None, None), false)]
+    fn test_custom_data_macro_eq_ignore_ts_init(#[case] other: CustomData, #[case] expected: bool) {
+        let data = stub_remote_data("1.00", 10, 11).data;
+
+        assert_eq!(data.eq_ignore_ts_init(other.data.as_ref()), expected);
+    }
+
+    #[cfg(feature = "python")]
+    #[rstest]
+    #[case::copy(1, 10, true)]
+    #[case::other_ts_event(1, 20, false)]
+    #[case::other_field(2, 10, false)]
+    fn test_python_custom_data_eq_ignore_ts_init(
+        #[case] value: i64,
+        #[case] ts_event: u64,
+        #[case] expected: bool,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            // Like a `@customdataclass`, the class compares its fields but not its timestamps
+            let locals = PyDict::new(py);
+            py.run(
+                c_str!(
+                    "\
+class Payload:
+    def __init__(self, value, ts_event, ts_init):
+        self.value = value
+        self.ts_event = ts_event
+        self.ts_init = ts_init
+    def __eq__(self, other):
+        return self.value == other.value
+"
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            let payload = locals.get_item("Payload").unwrap().unwrap();
+            let wrap = |value: i64, ts_event: u64, ts_init: u64| {
+                let data = payload.call1((value, ts_event, ts_init)).unwrap();
+                PythonCustomDataWrapper::new(py, &data).unwrap()
+            };
+
+            let data = wrap(1, 10, 11);
+
+            assert_eq!(data.eq_ignore_ts_init(&wrap(value, ts_event, 99)), expected);
+        });
     }
 }

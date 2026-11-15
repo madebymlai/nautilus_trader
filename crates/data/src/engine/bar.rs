@@ -20,9 +20,10 @@ use jiff::tz::TimeZone;
 use nautilus_common::{
     messages::data::{SubscribeBars, SubscribeCommand},
     msgbus::{self, MStr, Topic, TypedHandler},
+    warmup::{Delivered, same_bar, same_quote, same_trade},
 };
-use nautilus_core::{UUID4, datetime::get_timezone};
-use nautilus_model::data::{Bar, BarType, QuoteTick, TradeTick};
+use nautilus_core::{UUID4, UnixNanos, datetime::get_timezone};
+use nautilus_model::data::{Bar, BarType, Data, QuoteTick, TradeTick};
 
 use super::{
     AggregationSource, BAR_AGGREGATOR_PRIORITY, BarAggregation, BarAggregator, BarBarHandler,
@@ -216,12 +217,14 @@ impl DataEngine {
         key: &BarAggregatorKey,
         has_live_handlers: bool,
     ) {
+        let replayed = self.bar_aggregator_replayed.remove(key).unwrap_or_default();
+
         // Replay buffered updates before closing their last historical interval
         if has_live_handlers
             && let Some(warmup) = self.bar_aggregator_warmups.remove(key)
             && let Some(aggregator) = self.bar_aggregators.get(key)
         {
-            warmup.release(aggregator.borrow_mut().as_mut());
+            warmup.release(aggregator.borrow_mut().as_mut(), &replayed);
         }
 
         if let Some(aggregator) = self.bar_aggregators.get(key) {
@@ -269,7 +272,7 @@ impl DataEngine {
     }
 
     pub(super) fn update_request_bar_aggregators_from_quote(
-        &self,
+        &mut self,
         state: &RequestBarAggregation,
         request_id: UUID4,
         quote: QuoteTick,
@@ -287,11 +290,17 @@ impl DataEngine {
             self.update_request_bar_aggregator(*bar_type, aggregator_request_id, |aggregator| {
                 aggregator.handle_quote(quote);
             });
+            self.record_replay(
+                *bar_type,
+                aggregator_request_id,
+                quote.ts_event,
+                quote.into(),
+            );
         }
     }
 
     pub(super) fn update_request_bar_aggregators_from_trade(
-        &self,
+        &mut self,
         state: &RequestBarAggregation,
         request_id: UUID4,
         trade: TradeTick,
@@ -309,11 +318,17 @@ impl DataEngine {
             self.update_request_bar_aggregator(*bar_type, aggregator_request_id, |aggregator| {
                 aggregator.handle_trade(trade);
             });
+            self.record_replay(
+                *bar_type,
+                aggregator_request_id,
+                trade.ts_event,
+                trade.into(),
+            );
         }
     }
 
     pub(super) fn update_request_bar_aggregators_from_bar(
-        &self,
+        &mut self,
         state: &RequestBarAggregation,
         request_id: UUID4,
         bar: Bar,
@@ -330,6 +345,22 @@ impl DataEngine {
             self.update_request_bar_aggregator(*bar_type, aggregator_request_id, |aggregator| {
                 aggregator.handle_bar(bar);
             });
+            self.record_replay(*bar_type, aggregator_request_id, bar.ts_event, bar.into());
+        }
+    }
+
+    // Only the live aggregator an `update_subscriptions` request warms holds updates
+    fn record_replay(
+        &mut self,
+        bar_type: BarType,
+        request_id: Option<UUID4>,
+        ts_event: UnixNanos,
+        item: Data,
+    ) {
+        if request_id.is_none() {
+            let key = bar_aggregator_key(bar_type, None);
+            let replayed = self.bar_aggregator_replayed.entry(key).or_default();
+            replayed.record(ts_event, [item]);
         }
     }
 
@@ -1037,6 +1068,7 @@ impl DataEngine {
 
     fn unsubscribe_bar_aggregator_handlers(&mut self, key: &BarAggregatorKey) {
         self.bar_aggregator_warmups.remove(key);
+        self.bar_aggregator_replayed.remove(key);
 
         // Unsubscribe any registered message handlers
         if let Some(subs) = self.bar_aggregator_handlers.remove(key) {
@@ -1112,20 +1144,42 @@ pub(super) enum BarAggregatorWarmup {
 }
 
 impl BarAggregatorWarmup {
-    /// Ends the warm-up and feeds the held data to `aggregator` in arrival order.
-    pub(super) fn release(&self, aggregator: &mut dyn BarAggregator) {
+    /// Ends the warm-up and feeds the held data to `aggregator` in arrival order, dropping data
+    /// the request already `replayed` into it.
+    pub(super) fn release(&self, aggregator: &mut dyn BarAggregator, replayed: &Delivered<Data>) {
         match self {
             Self::Bar(buffer) => buffer
                 .release()
                 .into_iter()
+                .filter(|bar| {
+                    !replayed.includes(bar.ts_event, |items| {
+                        items
+                            .iter()
+                            .any(|item| matches!(item, Data::Bar(b) if same_bar(bar, b)))
+                    })
+                })
                 .for_each(|bar| aggregator.handle_bar(bar)),
             Self::Trade(buffer) => buffer
                 .release()
                 .into_iter()
+                .filter(|trade| {
+                    !replayed.includes(trade.ts_event, |items| {
+                        items
+                            .iter()
+                            .any(|item| matches!(item, Data::Trade(t) if same_trade(trade, t)))
+                    })
+                })
                 .for_each(|trade| aggregator.handle_trade(trade)),
             Self::Quote(buffer) => buffer
                 .release()
                 .into_iter()
+                .filter(|quote| {
+                    !replayed.includes(quote.ts_event, |items| {
+                        items
+                            .iter()
+                            .any(|item| matches!(item, Data::Quote(q) if same_quote(quote, q)))
+                    })
+                })
                 .for_each(|quote| aggregator.handle_quote(quote)),
         }
     }

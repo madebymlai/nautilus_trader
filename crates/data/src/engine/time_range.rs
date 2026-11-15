@@ -293,7 +293,7 @@ impl DataEngine {
     }
 
     fn process_time_range_pipeline_aggregation_response(
-        &self,
+        &mut self,
         parent_id: UUID4,
         resp: &DataResponse,
     ) {

@@ -543,3 +543,20 @@ pub struct StubRemoteData {
     pub ts_event: UnixNanos,
     pub ts_init: UnixNanos,
 }
+
+/// Builds a `CustomData` stub of the `#[custom_data]` type [`StubRemoteData`] for tests.
+#[must_use]
+pub fn stub_remote_data(price: &str, ts_event: u64, ts_init: u64) -> CustomData {
+    let inner = StubRemoteData::new(
+        InstrumentId::from("TEST.SIM"),
+        Price::from(price),
+        None,
+        AggressorSide::Buy,
+        Params::default(),
+        Vec::new(),
+        Vec::new(),
+        ts_event.into(),
+        ts_init.into(),
+    );
+    CustomData::from_arc(Arc::new(inner))
+}
