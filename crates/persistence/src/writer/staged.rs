@@ -67,7 +67,7 @@ enum StagingMessage {
 
 enum StagingReply {
     Operation(StagingResult<()>),
-    SealedPaths(StagingResult<Vec<PathBuf>>),
+    SealedPaths(Vec<PathBuf>),
     ShouldWriteCustom(bool),
     Closed(bool),
 }
@@ -118,9 +118,11 @@ impl StagingClient {
         self.request(StagingMessage::Flush)
     }
 
+    // Asks every open file to seal at its next later `ts_init` and returns the files sealed since
+    // the last request
     fn seal(&self) -> anyhow::Result<Vec<PathBuf>> {
         match self.query(StagingMessage::Seal)? {
-            StagingReply::SealedPaths(result) => result.map_err(anyhow::Error::msg),
+            StagingReply::SealedPaths(paths) => Ok(paths),
             _ => anyhow::bail!("Staging worker returned an unexpected reply"),
         }
     }
@@ -227,11 +229,8 @@ fn run_staging_worker(
                 let _ = reply.send(StagingReply::Operation(result));
             }
             StagingMessage::Seal(reply) => {
-                let result = writer
-                    .seal()
-                    .map(|()| sealed_rx.try_iter().collect())
-                    .map_err(|e| e.to_string());
-                let _ = reply.send(StagingReply::SealedPaths(result));
+                writer.seal_at_next_ts_init();
+                let _ = reply.send(StagingReply::SealedPaths(sealed_rx.try_iter().collect()));
             }
             StagingMessage::Close(reply) => {
                 let result = writer.close().map_err(|e| e.to_string());
@@ -868,11 +867,7 @@ mod tests {
             let StagingMessage::Seal(reply) = requests.recv().unwrap() else {
                 panic!("expected seal request")
             };
-            assert!(
-                reply
-                    .send(StagingReply::SealedPaths(Ok(vec![path])))
-                    .is_ok()
-            );
+            assert!(reply.send(StagingReply::SealedPaths(vec![path])).is_ok());
         });
         let driver = PromotionDriver::<RecordingBackend>::new(0_u64.into(), Vec::new());
         let staging_uri = directory.path().join("live/run-paths");

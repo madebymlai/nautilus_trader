@@ -339,8 +339,9 @@ struct FeatherFile {
     buffer_bytes: u64,
     /// The largest `ts_init` written, which the next file's rows must exceed.
     last_ts_init: Option<u64>,
-    /// The file reached `max_size`; the next row with a later `ts_init` opens a new file.
-    size_rotation_due: bool,
+    /// The file reached `max_size` or promotion asked to seal it; the next row with a later
+    /// `ts_init` opens a new file.
+    rotation_due: bool,
 }
 
 impl FeatherFile {
@@ -384,7 +385,7 @@ impl FeatherFile {
             buffer_rows: 0,
             buffer_bytes: 0,
             last_ts_init: None,
-            size_rotation_due: false,
+            rotation_due: false,
         })
     }
 
@@ -413,7 +414,7 @@ impl FeatherFile {
             self.write_buffer()?;
         }
 
-        self.size_rotation_due = self.size() >= max_size;
+        self.rotation_due = self.size() >= max_size;
         Ok(())
     }
 
@@ -765,7 +766,7 @@ impl FeatherWriter {
             return Ok(path);
         };
 
-        if !(scheduled || file.size_rotation_due)
+        if !(scheduled || file.rotation_due)
             || file.last_ts_init.is_some_and(|last| ts_init <= last)
         {
             return Ok(path);
@@ -1070,7 +1071,7 @@ impl FeatherWriter {
 
     /// Seals every open file so its complete stream is visible as a `.feather` file.
     ///
-    /// Writes after sealing open new files, so this is the boundary promotion uses.
+    /// Writes after sealing open new files.
     pub fn seal(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let paths = self.writers.keys().cloned().collect::<Vec<_>>();
         let mut first_error = None;
@@ -1085,6 +1086,16 @@ impl FeatherWriter {
         match first_error {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+
+    /// Seals every open file at its next row with a later `ts_init`, which opens a new file.
+    ///
+    /// Promotion seals through this rather than [`Self::seal`], so a row written after it with
+    /// the same `ts_init` as an open file's last row joins that file instead of starting the next.
+    pub(crate) fn seal_at_next_ts_init(&mut self) {
+        for file in self.writers.values_mut() {
+            file.rotation_due = true;
         }
     }
 
@@ -2331,6 +2342,33 @@ mod tests {
         assert_eq!(
             sealed_timestamps(temp_dir.path()),
             vec![vec![1, 1], vec![2, 2], vec![3]]
+        );
+    }
+
+    #[rstest]
+    fn promotion_seal_waits_for_the_next_ts_init() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut writer = FeatherWriter::new(
+            temp_dir.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            None,
+        );
+
+        writer.write(quote_at(1)).unwrap();
+        writer.seal_at_next_ts_init();
+        writer.write(quote_at(1)).unwrap();
+        assert_eq!(sealed_timestamps(temp_dir.path()), Vec::<Vec<u64>>::new());
+
+        writer.write(quote_at(2)).unwrap();
+        assert_eq!(sealed_timestamps(temp_dir.path()), vec![vec![1, 1]]);
+
+        writer.close().unwrap();
+        assert_eq!(
+            sealed_timestamps(temp_dir.path()),
+            vec![vec![1, 1], vec![2]]
         );
     }
 
