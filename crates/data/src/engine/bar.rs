@@ -287,6 +287,12 @@ impl DataEngine {
             self.update_request_bar_aggregator(*bar_type, aggregator_request_id, |aggregator| {
                 aggregator.handle_quote(quote);
             });
+
+            let key = bar_aggregator_key(*bar_type, aggregator_request_id);
+            if let Some(BarAggregatorWarmup::Quote(warmup)) = self.bar_aggregator_warmups.get(&key)
+            {
+                warmup.record_history(&quote);
+            }
         }
     }
 
@@ -309,6 +315,12 @@ impl DataEngine {
             self.update_request_bar_aggregator(*bar_type, aggregator_request_id, |aggregator| {
                 aggregator.handle_trade(trade);
             });
+
+            let key = bar_aggregator_key(*bar_type, aggregator_request_id);
+            if let Some(BarAggregatorWarmup::Trade(warmup)) = self.bar_aggregator_warmups.get(&key)
+            {
+                warmup.record_history(&trade);
+            }
         }
     }
 
@@ -330,6 +342,11 @@ impl DataEngine {
             self.update_request_bar_aggregator(*bar_type, aggregator_request_id, |aggregator| {
                 aggregator.handle_bar(bar);
             });
+
+            let key = bar_aggregator_key(*bar_type, aggregator_request_id);
+            if let Some(BarAggregatorWarmup::Bar(warmup)) = self.bar_aggregator_warmups.get(&key) {
+                warmup.record_history(&bar);
+            }
         }
     }
 
@@ -1112,7 +1129,8 @@ pub(super) enum BarAggregatorWarmup {
 }
 
 impl BarAggregatorWarmup {
-    /// Ends the warm-up and feeds the held data to `aggregator` in arrival order.
+    /// Ends the warm-up and feeds the held data the history did not deliver to `aggregator` in
+    /// arrival order.
     pub(super) fn release(&self, aggregator: &mut dyn BarAggregator) {
         match self {
             Self::Bar(buffer) => buffer
