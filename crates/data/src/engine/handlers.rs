@@ -65,19 +65,19 @@ impl WarmupData for QuoteTick {
         self.ts_event
     }
 
-    fn warmup_buffer(warmup: &BarAggregatorWarmup) -> Option<&WarmupBuffer<Self>> {
-        match warmup {
-            BarAggregatorWarmup::Quote(buffer) => Some(buffer),
-            _ => None,
-        }
-    }
-
     fn is_copy_of(&self, other: &Self) -> bool {
         self.instrument_id == other.instrument_id
             && self.bid_price == other.bid_price
             && self.ask_price == other.ask_price
             && self.bid_size == other.bid_size
             && self.ask_size == other.ask_size
+    }
+
+    fn warmup_buffer(warmup: &BarAggregatorWarmup) -> Option<&WarmupBuffer<Self>> {
+        match warmup {
+            BarAggregatorWarmup::Quote(buffer) => Some(buffer),
+            _ => None,
+        }
     }
 }
 
@@ -86,15 +86,15 @@ impl WarmupData for TradeTick {
         self.ts_event
     }
 
+    fn is_copy_of(&self, other: &Self) -> bool {
+        self.instrument_id == other.instrument_id && self.trade_id == other.trade_id
+    }
+
     fn warmup_buffer(warmup: &BarAggregatorWarmup) -> Option<&WarmupBuffer<Self>> {
         match warmup {
             BarAggregatorWarmup::Trade(buffer) => Some(buffer),
             _ => None,
         }
-    }
-
-    fn is_copy_of(&self, other: &Self) -> bool {
-        self.instrument_id == other.instrument_id && self.trade_id == other.trade_id
     }
 }
 
@@ -103,16 +103,16 @@ impl WarmupData for Bar {
         self.ts_event
     }
 
+    // A bar type closes one bar at each `ts_event`
+    fn is_copy_of(&self, other: &Self) -> bool {
+        self.bar_type == other.bar_type
+    }
+
     fn warmup_buffer(warmup: &BarAggregatorWarmup) -> Option<&WarmupBuffer<Self>> {
         match warmup {
             BarAggregatorWarmup::Bar(buffer) => Some(buffer),
             _ => None,
         }
-    }
-
-    // A bar type closes one bar at each `ts_event`
-    fn is_copy_of(&self, other: &Self) -> bool {
-        self.bar_type == other.bar_type
     }
 }
 
