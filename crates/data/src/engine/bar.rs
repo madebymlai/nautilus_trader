@@ -224,9 +224,11 @@ impl DataEngine {
         key: &BarAggregatorKey,
         has_live_handlers: bool,
     ) {
+        let warmup = self.bar_aggregator_warmups.remove(key);
+
         // Replay buffered updates before closing their last historical interval
-        if let Some(warmup) = self.bar_aggregator_warmups.remove(key)
-            && has_live_handlers
+        if has_live_handlers
+            && let Some(warmup) = warmup
             && let Some(aggregator) = self.bar_aggregators.get(key)
         {
             warmup.release(aggregator.borrow_mut().as_mut());
@@ -344,7 +346,6 @@ impl DataEngine {
         }
     }
 
-    // Lets a live subscription that comes later drop what the history already delivered
     fn record_request_history<T: WarmupData>(
         &self,
         bar_type: BarType,

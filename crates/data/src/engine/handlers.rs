@@ -39,9 +39,10 @@ pub(super) struct WarmupBuffer<T>(Rc<RefCell<Option<Warmup<T>>>>);
 
 /// The live data held during a warm-up, and the historical items at the last historical `ts_event`.
 ///
-/// Each historical item drops one held copy of itself. A copy that arrives after its historical
-/// item, as when a live stream replays its latest item, is matched against the items at the last
-/// historical `ts_event`.
+/// Each historical item drops one held copy of itself, which leaves `None` in its place in `held`,
+/// found through `held_at` by `ts_event`. A copy that arrives after its historical item, as when a
+/// live stream replays its latest item, is matched against the items at the last historical
+/// `ts_event`.
 #[derive(Debug)]
 struct Warmup<T> {
     held: Vec<Option<T>>,
