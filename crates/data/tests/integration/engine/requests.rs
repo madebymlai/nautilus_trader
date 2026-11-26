@@ -3178,3 +3178,106 @@ fn test_update_subscriptions_request_aggregator_skips_live_data_the_history_deli
     bar_times.reverse();
     assert_eq!(bar_times, expected_bar_times);
 }
+
+#[rstest]
+fn test_update_subscriptions_request_aggregator_skips_live_data_delivered_before_subscribe(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    let instrument_id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    let bar_type = BarType::from(format!("{instrument_id}-1-TICK-LAST-INTERNAL").as_str());
+    let request_id = UUID4::new();
+    let params: Params = serde_json::from_value(json!({
+        "bar_types": [bar_type.to_string()],
+        "update_subscriptions": true,
+    }))
+    .unwrap();
+    data_engine.execute(DataCommand::Request(RequestCommand::Trades(
+        RequestTrades::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::default(),
+            Some(params.clone()),
+        ),
+    )));
+
+    let make_trade = |ts_event: u64, ts_init: u64, trade_id: &str| {
+        TradeTick::new(
+            instrument_id,
+            Price::from("0.65000"),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(trade_id),
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_init),
+        )
+    };
+
+    // The history arrives before the live subscription, and the request completes with no more data
+    data_engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Trades(TradesResponse::new(
+            request_id,
+            client_id,
+            instrument_id,
+            vec![
+                make_trade(1_000, 1_000, "trade-1"),
+                make_trade(2_000, 2_000, "trade-2"),
+            ],
+            None,
+            None,
+            UnixNanos::from(10_000),
+            Some(params),
+        )),
+        false,
+        None,
+    ));
+    data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+        SubscribeBars::new(
+            bar_type,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ),
+    )));
+    data_engine.process_data(Data::Trade(make_trade(2_000, 2_500, "trade-2")));
+    data_engine.process_data(Data::Trade(make_trade(3_000, 3_000, "trade-3")));
+    data_engine.response_envelope(DataResponseEnvelope::terminal(request_id, None));
+
+    let mut bar_times: Vec<u64> = cache
+        .borrow()
+        .bars(&bar_type)
+        .unwrap_or_default()
+        .iter()
+        .map(|bar| bar.ts_event.as_u64())
+        .collect();
+    bar_times.reverse();
+    assert_eq!(bar_times, [1_000, 2_000, 3_000]);
+}

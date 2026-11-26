@@ -23,6 +23,7 @@ use nautilus_model::{
 };
 use ustr::Ustr;
 
+use super::bar::BarAggregatorWarmup;
 use crate::aggregation::{BarAggregator, SpreadQuoteAggregator};
 
 // Between built-in handlers (10) and default user handlers (0)
@@ -35,24 +36,35 @@ pub(super) const BAR_AGGREGATOR_PRIORITY: u32 = 5;
 #[derive(Debug)]
 pub(super) struct WarmupBuffer<T>(Rc<RefCell<Option<Warmup<T>>>>);
 
+/// The live data held during a warm-up, and the last historical `ts_event` with the historical
+/// items at it.
 #[derive(Debug)]
 struct Warmup<T> {
     held: Vec<T>,
-    // The last historical `ts_event` and the historical items at it
     history_end: Option<(UnixNanos, Vec<T>)>,
 }
 
-/// Data a [`WarmupBuffer`] can match against the historical data it replays after.
+/// Data a [`WarmupBuffer`] can match against the history replayed before it.
 pub(super) trait WarmupData: Copy {
     fn ts_event(&self) -> UnixNanos;
 
-    /// Returns whether `other` is another copy of the same venue item, whatever its `ts_init`.
+    /// Returns whether `other`, at the same `ts_event`, is another copy of the same venue item.
     fn is_same(&self, other: &Self) -> bool;
+
+    /// Returns the buffer in `warmup` that holds this data type, if any.
+    fn warmup_buffer(warmup: &BarAggregatorWarmup) -> Option<&WarmupBuffer<Self>>;
 }
 
 impl WarmupData for QuoteTick {
     fn ts_event(&self) -> UnixNanos {
         self.ts_event
+    }
+
+    fn warmup_buffer(warmup: &BarAggregatorWarmup) -> Option<&WarmupBuffer<Self>> {
+        match warmup {
+            BarAggregatorWarmup::Quote(buffer) => Some(buffer),
+            _ => None,
+        }
     }
 
     fn is_same(&self, other: &Self) -> bool {
@@ -61,13 +73,19 @@ impl WarmupData for QuoteTick {
             && self.ask_price == other.ask_price
             && self.bid_size == other.bid_size
             && self.ask_size == other.ask_size
-            && self.ts_event == other.ts_event
     }
 }
 
 impl WarmupData for TradeTick {
     fn ts_event(&self) -> UnixNanos {
         self.ts_event
+    }
+
+    fn warmup_buffer(warmup: &BarAggregatorWarmup) -> Option<&WarmupBuffer<Self>> {
+        match warmup {
+            BarAggregatorWarmup::Trade(buffer) => Some(buffer),
+            _ => None,
+        }
     }
 
     fn is_same(&self, other: &Self) -> bool {
@@ -80,6 +98,13 @@ impl WarmupData for Bar {
         self.ts_event
     }
 
+    fn warmup_buffer(warmup: &BarAggregatorWarmup) -> Option<&WarmupBuffer<Self>> {
+        match warmup {
+            BarAggregatorWarmup::Bar(buffer) => Some(buffer),
+            _ => None,
+        }
+    }
+
     fn is_same(&self, other: &Self) -> bool {
         self.bar_type == other.bar_type
             && self.open == other.open
@@ -87,7 +112,6 @@ impl WarmupData for Bar {
             && self.low == other.low
             && self.close == other.close
             && self.volume == other.volume
-            && self.ts_event == other.ts_event
     }
 }
 
@@ -116,12 +140,20 @@ impl<T: WarmupData> WarmupBuffer<T> {
         }
     }
 
+    /// Drops the held data and keeps holding.
+    pub(super) fn drop_held(&self) {
+        if let Some(warmup) = self.0.borrow_mut().as_mut() {
+            warmup.held.clear();
+        }
+    }
+
     /// Records a historical `item` replayed while warming up.
     pub(super) fn record_history(&self, item: &T) {
         let mut warmup = self.0.borrow_mut();
         let Some(warmup) = warmup.as_mut() else {
             return;
         };
+
         let ts_event = item.ts_event();
 
         match &mut warmup.history_end {
@@ -139,6 +171,7 @@ impl<T: WarmupData> WarmupBuffer<T> {
         let Some(Warmup { held, history_end }) = self.0.borrow_mut().take() else {
             return Vec::new();
         };
+
         let Some((last, mut delivered)) = history_end else {
             return held;
         };
