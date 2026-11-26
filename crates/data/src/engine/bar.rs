@@ -1132,7 +1132,10 @@ fn sources_before_dependents(bar_types: &[BarType]) -> Vec<BarType> {
     ordered
 }
 
-/// Live data held back for a bar aggregator that is still replaying a historical request.
+/// The live data a bar aggregator holds while it replays a request's history, and the record of
+/// that history that drops the held copies.
+///
+/// A request with `update_subscriptions` creates it, and it lives until the request completes.
 #[derive(Debug)]
 pub(super) enum BarAggregatorWarmup {
     Bar(WarmupBuffer<Bar>),

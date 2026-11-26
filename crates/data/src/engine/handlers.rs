@@ -40,8 +40,8 @@ pub(super) struct WarmupBuffer<T>(Rc<RefCell<Option<WarmupState<T>>>>);
 /// The live data held during a warm-up, and the historical items at the last historical `ts_event`.
 ///
 /// Each historical item drops one held copy of itself, which leaves `None` in its place in `held`,
-/// found through `held_by_ts_event`. A copy that arrives after its historical item, as when a live
-/// stream replays its latest item, is matched against the items at the last historical `ts_event`.
+/// found through `held_by_ts_event`. The items at the last historical `ts_event` stay recorded, so
+/// a copy that arrives after them, as when a live stream replays its latest item, is dropped too.
 #[derive(Debug)]
 struct WarmupState<T> {
     held: Vec<Option<T>>,
@@ -110,13 +110,9 @@ impl WarmupData for Bar {
         }
     }
 
+    // A bar type closes one bar at each `ts_event`
     fn is_copy_of(&self, other: &Self) -> bool {
         self.bar_type == other.bar_type
-            && self.open == other.open
-            && self.high == other.high
-            && self.low == other.low
-            && self.close == other.close
-            && self.volume == other.volume
     }
 }
 
@@ -180,15 +176,6 @@ impl<T: WarmupData> WarmupBuffer<T> {
 
         let ts_event = item.ts_event();
 
-        if let Some(indices) = warmup.held_by_ts_event.get_mut(&ts_event)
-            && let Some(position) = indices
-                .iter()
-                .position(|&index| warmup.held[index].is_some_and(|held| held.is_copy_of(item)))
-        {
-            warmup.held[indices.swap_remove(position)] = None;
-            return;
-        }
-
         match &mut warmup.history_end {
             Some((last, items)) if ts_event == *last => items.push(*item),
             Some((last, items)) if ts_event > *last => {
@@ -198,6 +185,14 @@ impl<T: WarmupData> WarmupBuffer<T> {
             }
             Some(_) => {}
             None => warmup.history_end = Some((ts_event, vec![*item])),
+        }
+
+        if let Some(indices) = warmup.held_by_ts_event.get_mut(&ts_event)
+            && let Some(position) = indices
+                .iter()
+                .position(|&index| warmup.held[index].is_some_and(|held| held.is_copy_of(item)))
+        {
+            warmup.held[indices.swap_remove(position)] = None;
         }
     }
 
@@ -428,7 +423,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_warmup_release_drops_held_copy_of_historical_bar() {
+    fn test_warmup_release_drops_held_bar_for_a_historical_close() {
         let bar_type = BarType::from("AUD/USD.SIM-1-MINUTE-BID-EXTERNAL");
         let bar = |close: &str, ts_init: u64| {
             Bar::new(
@@ -443,14 +438,18 @@ mod tests {
             )
         };
         let warmup = WarmupBuffer::new();
-        let held = [bar("1.00000", 60_500), bar("1.00005", 60_500)];
+        let revised = bar("1.00005", 60_500);
+        let newer = Bar {
+            ts_event: UnixNanos::from(120_000),
+            ..revised
+        };
 
-        for item in &held {
-            assert!(warmup.hold(item));
+        for item in [revised, newer] {
+            assert!(warmup.hold(&item));
         }
         warmup.record_history(&bar("1.00000", 60_000));
 
-        assert_eq!(warmup.release(), vec![held[1]]);
+        assert_eq!(warmup.release(), vec![newer]);
     }
 
     #[rstest]
