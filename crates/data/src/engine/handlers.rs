@@ -35,18 +35,17 @@ pub(super) const BAR_AGGREGATOR_PRIORITY: u32 = 5;
 /// The buffer collects while it is `Some` and is emptied by [`WarmupBuffer::release`], after which
 /// the handlers holding it pass data straight through again.
 #[derive(Debug)]
-pub(super) struct WarmupBuffer<T>(Rc<RefCell<Option<Warmup<T>>>>);
+pub(super) struct WarmupBuffer<T>(Rc<RefCell<Option<WarmupState<T>>>>);
 
 /// The live data held during a warm-up, and the historical items at the last historical `ts_event`.
 ///
 /// Each historical item drops one held copy of itself, which leaves `None` in its place in `held`,
-/// found through `held_at` by `ts_event`. A copy that arrives after its historical item, as when a
-/// live stream replays its latest item, is matched against the items at the last historical
-/// `ts_event`.
+/// found through `held_by_ts_event`. A copy that arrives after its historical item, as when a live
+/// stream replays its latest item, is matched against the items at the last historical `ts_event`.
 #[derive(Debug)]
-struct Warmup<T> {
+struct WarmupState<T> {
     held: Vec<Option<T>>,
-    held_at: AHashMap<UnixNanos, Vec<usize>>,
+    held_by_ts_event: AHashMap<UnixNanos, Vec<usize>>,
     history_end: Option<(UnixNanos, Vec<T>)>,
 }
 
@@ -55,7 +54,7 @@ pub(super) trait WarmupData: Copy {
     fn ts_event(&self) -> UnixNanos;
 
     /// Returns whether `other`, at the same `ts_event`, is another copy of the same venue item.
-    fn is_same(&self, other: &Self) -> bool;
+    fn is_copy_of(&self, other: &Self) -> bool;
 
     /// Returns the buffer in `warmup` that holds this data type, if any.
     fn warmup_buffer(warmup: &BarAggregatorWarmup) -> Option<&WarmupBuffer<Self>>;
@@ -73,7 +72,7 @@ impl WarmupData for QuoteTick {
         }
     }
 
-    fn is_same(&self, other: &Self) -> bool {
+    fn is_copy_of(&self, other: &Self) -> bool {
         self.instrument_id == other.instrument_id
             && self.bid_price == other.bid_price
             && self.ask_price == other.ask_price
@@ -94,7 +93,7 @@ impl WarmupData for TradeTick {
         }
     }
 
-    fn is_same(&self, other: &Self) -> bool {
+    fn is_copy_of(&self, other: &Self) -> bool {
         self.instrument_id == other.instrument_id && self.trade_id == other.trade_id
     }
 }
@@ -111,7 +110,7 @@ impl WarmupData for Bar {
         }
     }
 
-    fn is_same(&self, other: &Self) -> bool {
+    fn is_copy_of(&self, other: &Self) -> bool {
         self.bar_type == other.bar_type
             && self.open == other.open
             && self.high == other.high
@@ -129,9 +128,9 @@ impl<T> Clone for WarmupBuffer<T> {
 
 impl<T: WarmupData> WarmupBuffer<T> {
     pub(super) fn new() -> Self {
-        Self(Rc::new(RefCell::new(Some(Warmup {
+        Self(Rc::new(RefCell::new(Some(WarmupState {
             held: Vec::new(),
-            held_at: AHashMap::new(),
+            held_by_ts_event: AHashMap::new(),
             history_end: None,
         }))))
     }
@@ -149,14 +148,14 @@ impl<T: WarmupData> WarmupBuffer<T> {
 
         if let Some((last, delivered)) = &mut warmup.history_end
             && ts_event == *last
-            && let Some(index) = delivered.iter().position(|d| d.is_same(item))
+            && let Some(index) = delivered.iter().position(|d| d.is_copy_of(item))
         {
             delivered.swap_remove(index);
             return true;
         }
 
         warmup
-            .held_at
+            .held_by_ts_event
             .entry(ts_event)
             .or_default()
             .push(warmup.held.len());
@@ -168,7 +167,7 @@ impl<T: WarmupData> WarmupBuffer<T> {
     pub(super) fn drop_held(&self) {
         if let Some(warmup) = self.0.borrow_mut().as_mut() {
             warmup.held.clear();
-            warmup.held_at.clear();
+            warmup.held_by_ts_event.clear();
         }
     }
 
@@ -181,10 +180,10 @@ impl<T: WarmupData> WarmupBuffer<T> {
 
         let ts_event = item.ts_event();
 
-        if let Some(indices) = warmup.held_at.get_mut(&ts_event)
+        if let Some(indices) = warmup.held_by_ts_event.get_mut(&ts_event)
             && let Some(position) = indices
                 .iter()
-                .position(|&index| warmup.held[index].is_some_and(|held| held.is_same(item)))
+                .position(|&index| warmup.held[index].is_some_and(|held| held.is_copy_of(item)))
         {
             warmup.held[indices.swap_remove(position)] = None;
             return;
