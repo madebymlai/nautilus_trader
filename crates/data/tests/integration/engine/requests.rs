@@ -3077,8 +3077,9 @@ fn test_request_trades_with_bar_types_param_sets_up_aggregation_through_streamin
 
 #[rstest]
 #[case::live_copy_of_history_end(&[(2_000, 2_500, "trade-2")], &[1_000, 2_000])]
+#[case::live_copy_of_earlier_history(&[(1_000, 2_500, "trade-1")], &[1_000, 2_000])]
 #[case::distinct_trade_at_history_end(&[(2_000, 2_500, "trade-3")], &[1_000, 2_000, 2_500])]
-#[case::trade_before_history_end(&[(1_500, 2_500, "trade-0")], &[1_000, 2_000])]
+#[case::late_print_before_history_end(&[(1_500, 2_500, "trade-0")], &[1_000, 2_000, 2_500])]
 #[case::trade_after_history_end(&[(3_000, 3_000, "trade-3")], &[1_000, 2_000, 3_000])]
 fn test_update_subscriptions_request_aggregator_skips_live_data_the_history_delivered(
     #[case] live: &[(u64, u64, &str)],
@@ -3180,7 +3181,10 @@ fn test_update_subscriptions_request_aggregator_skips_live_data_the_history_deli
 }
 
 #[rstest]
+#[case::subscribed(false)]
+#[case::resubscribed(true)]
 fn test_update_subscriptions_request_aggregator_skips_live_data_delivered_before_subscribe(
+    #[case] resubscribe: bool,
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
@@ -3256,8 +3260,8 @@ fn test_update_subscriptions_request_aggregator_skips_live_data_delivered_before
         false,
         None,
     ));
-    data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(
-        SubscribeBars::new(
+    let subscribe = || {
+        DataCommand::Subscribe(SubscribeCommand::Bars(SubscribeBars::new(
             bar_type,
             Some(client_id),
             Some(venue),
@@ -3265,8 +3269,24 @@ fn test_update_subscriptions_request_aggregator_skips_live_data_delivered_before
             UnixNanos::default(),
             None,
             None,
-        ),
-    )));
+        )))
+    };
+    data_engine.execute(subscribe());
+
+    if resubscribe {
+        data_engine.execute(DataCommand::Unsubscribe(UnsubscribeCommand::Bars(
+            UnsubscribeBars::new(
+                bar_type,
+                Some(client_id),
+                Some(venue),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )));
+        data_engine.execute(subscribe());
+    }
     data_engine.process_data(Data::Trade(make_trade(2_000, 2_500, "trade-2")));
     data_engine.process_data(Data::Trade(make_trade(3_000, 3_000, "trade-3")));
     data_engine.response_envelope(DataResponseEnvelope::terminal(request_id, None));
@@ -3280,4 +3300,132 @@ fn test_update_subscriptions_request_aggregator_skips_live_data_delivered_before
         .collect();
     bar_times.reverse();
     assert_eq!(bar_times, [1_000, 2_000, 3_000]);
+}
+
+#[rstest]
+fn test_update_subscriptions_request_chain_counts_live_copy_of_history_once(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    const SEC: u64 = 1_000_000_000;
+    // Aligned to a 5-minute boundary
+    let boundary = 1_700_000_100 * SEC;
+
+    let _ = stub_msgbus;
+    let virtual_clock = Rc::new(RefCell::new(VirtualClock::new()));
+    virtual_clock
+        .borrow_mut()
+        .set_time(UnixNanos::from(boundary + 10 * SEC));
+    let clock: Rc<RefCell<dyn Clock>> = virtual_clock;
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    let instrument_id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        Rc::clone(&cache),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    let source = BarType::from(format!("{instrument_id}-1-MINUTE-LAST-INTERNAL").as_str());
+    let composite =
+        BarType::from(format!("{instrument_id}-5-MINUTE-LAST-INTERNAL@1-MINUTE-INTERNAL").as_str());
+    let request_id = UUID4::new();
+    let params: Params = serde_json::from_value(json!({
+        "bar_types": [source.to_string(), composite.to_string()],
+        "update_subscriptions": true,
+    }))
+    .unwrap();
+    data_engine.execute(DataCommand::Request(RequestCommand::Trades(
+        RequestTrades::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            UnixNanos::from(boundary + 10 * SEC),
+            Some(params.clone()),
+        ),
+    )));
+
+    for bar_type in [source, composite] {
+        data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Bars(
+            SubscribeBars::new(
+                bar_type,
+                Some(client_id),
+                Some(venue),
+                UUID4::new(),
+                UnixNanos::from(boundary + 10 * SEC),
+                None,
+                None,
+            ),
+        )));
+    }
+
+    let make_trade = |ts_event: u64, ts_init: u64, trade_id: &str| {
+        TradeTick::new(
+            instrument_id,
+            Price::from("0.65000"),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(trade_id),
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_init),
+        )
+    };
+
+    // A live copy of the history's last trade, then a new trade, arrive while the response is in
+    // flight.
+    data_engine.process_data(Data::Trade(make_trade(
+        boundary - 30 * SEC,
+        boundary - 29 * SEC,
+        "trade-2",
+    )));
+    data_engine.process_data(Data::Trade(make_trade(
+        boundary + 5 * SEC,
+        boundary + 5 * SEC,
+        "trade-3",
+    )));
+    data_engine.response(DataResponse::Trades(TradesResponse::new(
+        request_id,
+        client_id,
+        instrument_id,
+        vec![
+            make_trade(boundary - 90 * SEC, boundary - 90 * SEC, "trade-1"),
+            make_trade(boundary - 30 * SEC, boundary - 30 * SEC, "trade-2"),
+        ],
+        None,
+        None,
+        UnixNanos::from(boundary + 10 * SEC),
+        Some(params),
+    )));
+
+    let cache_ref = cache.borrow();
+    let volumes = |bar_type: BarType| -> Vec<(UnixNanos, Quantity)> {
+        let mut bars = cache_ref.bars(&bar_type.standard()).unwrap_or_default();
+        bars.reverse();
+        bars.iter().map(|bar| (bar.ts_event, bar.volume)).collect()
+    };
+    assert_eq!(
+        volumes(source),
+        vec![
+            (UnixNanos::from(boundary - 60 * SEC), Quantity::from("1000")),
+            (UnixNanos::from(boundary), Quantity::from("1000")),
+        ],
+    );
+    assert_eq!(
+        volumes(composite),
+        vec![(UnixNanos::from(boundary), Quantity::from("2000"))],
+    );
 }
