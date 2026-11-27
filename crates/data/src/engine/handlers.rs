@@ -107,31 +107,43 @@ impl<T: WarmupData> WarmupBuffer<T> {
 
     /// Ends the warm-up and returns the held data the history did not deliver, in arrival order.
     ///
-    /// At each `ts_event`, the held items drop one historical copy each, up to the first that is
-    /// not a copy. A live stream repeats the history from where it starts, so its copies come first.
+    /// A live stream repeats the history from where it starts, so at each `ts_event` the copies
+    /// are the longest run of held items that repeats the end of the history, in order.
     pub(super) fn release(&self) -> Vec<T> {
-        let Some(WarmupState {
-            held, mut history, ..
-        }) = self.0.borrow_mut().take()
-        else {
-            return Vec::new();
-        };
+        let WarmupState { held, history, .. } = self.0.borrow_mut().take().expect(WARMING_UP);
+        let mut held_by_ts_event: AHashMap<UnixNanos, Vec<usize>> = AHashMap::new();
+
+        for (index, item) in held.iter().enumerate() {
+            held_by_ts_event
+                .entry(item.ts_event())
+                .or_default()
+                .push(index);
+        }
+
+        let mut is_copy = vec![false; held.len()];
+
+        for (ts_event, indices) in &held_by_ts_event {
+            let Some(delivered) = history.get(ts_event) else {
+                continue;
+            };
+            let overlap = (1..=indices.len().min(delivered.len()))
+                .rev()
+                .find(|&len| {
+                    indices[..len]
+                        .iter()
+                        .zip(&delivered[delivered.len() - len..])
+                        .all(|(&index, item)| held[index].is_copy_of(item))
+                })
+                .unwrap_or(0);
+
+            for &index in &indices[..overlap] {
+                is_copy[index] = true;
+            }
+        }
 
         held.into_iter()
-            .filter(|item| {
-                let ts_event = item.ts_event();
-                let Some(delivered) = history.get_mut(&ts_event) else {
-                    return true;
-                };
-
-                if let Some(index) = delivered.iter().position(|d| d.is_copy_of(item)) {
-                    delivered.swap_remove(index);
-                    false
-                } else {
-                    history.remove(&ts_event);
-                    true
-                }
-            })
+            .zip(is_copy)
+            .filter_map(|(item, is_copy)| (!is_copy).then_some(item))
             .collect()
     }
 }
@@ -434,19 +446,17 @@ mod tests {
     }
 
     #[rstest]
-    fn test_warmup_release_keeps_quotes_held_after_one_the_history_lacks() {
+    fn test_warmup_release_drops_held_copies_only_in_history_order() {
         let warmup = WarmupBuffer::new();
-        let held = [
-            quote("1.00001", 5_000, 5_300),
-            quote("1.00000", 5_000, 5_600),
-        ];
+        let returned = quote("1.00000", 5_000, 5_600);
 
-        for item in &held {
-            assert!(warmup.hold(item));
+        for item in [quote("1.00001", 5_000, 5_300), returned] {
+            assert!(warmup.hold(&item));
         }
         warmup.record_history(&quote("1.00000", 5_000, 5_000));
+        warmup.record_history(&quote("1.00001", 5_000, 5_100));
 
-        assert_eq!(warmup.release(), held.to_vec());
+        assert_eq!(warmup.release(), vec![returned]);
     }
 
     #[rstest]
