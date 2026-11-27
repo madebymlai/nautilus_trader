@@ -107,10 +107,14 @@ impl<T: WarmupData> WarmupBuffer<T> {
 
     /// Ends the warm-up and returns the held data the history did not deliver, in arrival order.
     ///
-    /// A live stream repeats the history from where it starts, so at each `ts_event` the copies
-    /// are the longest run of held items that repeats the end of the history, in order.
+    /// A held item with an identity drops the historical item it copies at its `ts_event`,
+    /// wherever it arrives. A live stream repeats the history from where it starts, so at each
+    /// `ts_event` the copies of items without one are the longest run of held items that repeats
+    /// the end of the history, in order.
     pub(super) fn release(&self) -> Vec<T> {
-        let WarmupState { held, history, .. } = self.0.borrow_mut().take().expect(WARMING_UP);
+        let WarmupState {
+            held, mut history, ..
+        } = self.0.borrow_mut().take().expect(WARMING_UP);
         let mut held_by_ts_event: AHashMap<UnixNanos, Vec<usize>> = AHashMap::new();
 
         for (index, item) in held.iter().enumerate() {
@@ -123,9 +127,21 @@ impl<T: WarmupData> WarmupBuffer<T> {
         let mut is_copy = vec![false; held.len()];
 
         for (ts_event, indices) in &held_by_ts_event {
-            let Some(delivered) = history.get(ts_event) else {
+            let Some(delivered) = history.get_mut(ts_event) else {
                 continue;
             };
+
+            if T::HAS_IDENTITY {
+                for &index in indices {
+                    if let Some(position) = delivered.iter().position(|d| held[index].is_copy_of(d))
+                    {
+                        delivered.swap_remove(position);
+                        is_copy[index] = true;
+                    }
+                }
+                continue;
+            }
+
             let overlap = (1..=indices.len().min(delivered.len()))
                 .rev()
                 .find(|&len| {
@@ -162,6 +178,9 @@ struct WarmupState<T> {
 
 /// Data a [`WarmupBuffer`] can match against the history it is replayed with.
 pub(super) trait WarmupData: Copy {
+    /// Whether `is_copy_of` identifies one venue item, so its copy matches wherever it arrives.
+    const HAS_IDENTITY: bool;
+
     fn ts_event(&self) -> UnixNanos;
 
     /// Returns whether `other`, at the same `ts_event`, is another copy of the same venue item.
@@ -172,6 +191,8 @@ pub(super) trait WarmupData: Copy {
 }
 
 impl WarmupData for QuoteTick {
+    const HAS_IDENTITY: bool = false;
+
     fn ts_event(&self) -> UnixNanos {
         self.ts_event
     }
@@ -193,6 +214,8 @@ impl WarmupData for QuoteTick {
 }
 
 impl WarmupData for TradeTick {
+    const HAS_IDENTITY: bool = true;
+
     fn ts_event(&self) -> UnixNanos {
         self.ts_event
     }
@@ -210,6 +233,8 @@ impl WarmupData for TradeTick {
 }
 
 impl WarmupData for Bar {
+    const HAS_IDENTITY: bool = true;
+
     fn ts_event(&self) -> UnixNanos {
         self.ts_event
     }
@@ -407,7 +432,11 @@ impl Handler<QuoteTick> for SpreadQuoteHandler {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_model::types::{Price, Quantity};
+    use nautilus_model::{
+        enums::AggressorSide,
+        identifiers::TradeId,
+        types::{Price, Quantity},
+    };
     use rstest::rstest;
 
     use super::*;
@@ -419,6 +448,18 @@ mod tests {
             Price::from("1.00010"),
             Quantity::from("1000"),
             Quantity::from("1000"),
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_init),
+        )
+    }
+
+    fn trade(trade_id: &str, ts_event: u64, ts_init: u64) -> TradeTick {
+        TradeTick::new(
+            InstrumentId::from("AUD/USD.SIM"),
+            Price::from("1.00000"),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(trade_id),
             UnixNanos::from(ts_event),
             UnixNanos::from(ts_init),
         )
@@ -457,6 +498,31 @@ mod tests {
         warmup.record_history(&quote("1.00001", 5_000, 5_100));
 
         assert_eq!(warmup.release(), vec![returned]);
+    }
+
+    #[rstest]
+    fn test_warmup_release_drops_a_held_run_repeating_the_history_end() {
+        let warmup = WarmupBuffer::new();
+
+        for (bid, ts_init) in [("1.00000", 5_300), ("1.00001", 5_400), ("1.00000", 5_500)] {
+            assert!(warmup.hold(&quote(bid, 5_000, ts_init)));
+        }
+
+        for (bid, ts_init) in [("1.00000", 5_000), ("1.00001", 5_100), ("1.00000", 5_200)] {
+            warmup.record_history(&quote(bid, 5_000, ts_init));
+        }
+
+        assert_eq!(warmup.release(), Vec::<QuoteTick>::new());
+    }
+
+    #[rstest]
+    fn test_warmup_release_drops_held_trade_lagging_the_history() {
+        let warmup = WarmupBuffer::new();
+        assert!(warmup.hold(&trade("trade-1", 5_000, 5_500)));
+        warmup.record_history(&trade("trade-1", 5_000, 5_000));
+        warmup.record_history(&trade("trade-2", 5_000, 5_100));
+
+        assert_eq!(warmup.release(), Vec::<TradeTick>::new());
     }
 
     #[rstest]
