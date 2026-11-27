@@ -13,41 +13,44 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, fmt::Display, hash::Hash, str::FromStr, sync::Arc};
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
+use anyhow::Context;
 use bytes::Bytes;
-use futures::future::join_all;
+use futures::future::try_join_all;
 #[cfg(feature = "defi")]
 use nautilus_common::{cache::CacheSnapshotRef, defi::cache::InstrumentMigration};
 use nautilus_common::{
-    cache::database::{CacheMap, register_loaded_currencies},
+    cache::{
+        CacheConfig,
+        database::{CacheMap, register_loaded_currencies},
+    },
     enums::SerializationEncoding,
 };
-use nautilus_core::serialization::timestamps;
+use nautilus_core::{UUID4, UnixNanos, serialization::timestamps};
 use nautilus_model::{
-    accounts::AccountAny,
+    accounts::{Account, AccountAny, BaseAccount},
     data::{CustomData, DataType, HasTsInit, InstrumentClose},
     enums::CurrencyType,
     events::{AccountState, OrderFilled, PositionSnapshot},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId},
-    instruments::{InstrumentAny, SyntheticInstrument},
+    instruments::{Instrument, InstrumentAny, SyntheticInstrument},
     orders::{Order, OrderAny},
     position::Position,
-    types::Currency,
+    types::{AccountBalance, Currency, Money, Price},
 };
 #[cfg(feature = "defi")]
 use nautilus_model::{
     defi::currency::{self, TokenCurrency},
     events::OrderSnapshot,
-    instruments::Instrument,
 };
 use redis::{AsyncCommands, aio::ConnectionManager};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use ustr::Ustr;
 
-use super::get_index_key;
+use super::{ORDER_ACTIVATIONS, get_index_key};
 #[cfg(feature = "defi")]
 use crate::defi::{contract_conflict, integrity_error, redis_read_error, validate_marker};
 use crate::order_replay::transform_order;
@@ -129,6 +132,12 @@ enum CurrencyDecode {
     Undecodable(anyhow::Error),
 }
 
+#[derive(Serialize, Deserialize)]
+pub(super) struct OrderActivationRecord {
+    pub init_id: UUID4,
+    pub activation_price: Price,
+}
+
 // Collection keys
 const INDEX: &str = "index";
 const GENERAL: &str = "general";
@@ -145,6 +154,8 @@ const ACTORS: &str = "actors";
 const STRATEGIES: &str = "strategies";
 const CUSTOM: &str = "custom";
 const REDIS_DELIMITER: char = ':';
+
+const CHECKPOINT_TAG: &[u8] = b"\x00nautilus-account-checkpoint-v1\x00";
 
 // Index keys
 const INDEX_ORDER_IDS: &str = "index:order_ids";
@@ -858,7 +869,7 @@ impl DatabaseQueries {
                 Self::load_orders(con, trader_key, encoding),
                 Self::load_positions(con, trader_key, encoding)
             )
-            .map_err(|e| anyhow::anyhow!("Error loading cache data: {e}"))?;
+            .context("failed to load Redis cache data")?;
 
         Ok(CacheMap {
             currencies,
@@ -907,7 +918,10 @@ impl DatabaseQueries {
         };
 
         match Self::deserialize_payload::<String>(encoding, value_bytes) {
-            Ok(code) => match Currency::try_from_str(&code) {
+            Ok(value) if value != code.as_str() => CurrencyDecode::InvalidRecord(anyhow::anyhow!(
+                "bare currency code '{value}' does not match key '{code}'"
+            )),
+            Ok(_) => match Currency::try_from_str(code.as_str()) {
                 Some(currency) => {
                     #[cfg(feature = "defi")]
                     if currency::lookup(currency.code).is_some() {
@@ -968,38 +982,37 @@ impl DatabaseQueries {
         for (key, value_opt) in keys.iter().zip(bulk_values.iter()) {
             // A code can contain the delimiter (Hyperliquid HIP-3 assets such as `xyz:TSLA`), so
             // the code is everything after the collection prefix, not the last segment.
-            let currency_code = match key.as_str().strip_prefix(prefix.as_str()) {
-                Some(code) if !code.is_empty() => Ustr::from(code),
-                _ => {
-                    log::error!("Invalid key format: {key}");
-                    continue;
-                }
+            let Some(code) = key.strip_prefix(&prefix) else {
+                continue;
             };
 
-            if let Some(value_bytes) = value_opt {
-                match Self::decode_currency(encoding, value_bytes, currency_code) {
-                    CurrencyDecode::Currency(currency) => {
-                        // The key names the code the dependents resolve, so a record filed under
-                        // another code would register one currency and index another.
-                        if currency.code != currency_code {
-                            anyhow::bail!(
-                                "Currency record under key {currency_code} holds code {}",
-                                currency.code
-                            );
-                        }
-                        currencies.insert(currency_code, currency);
-                    }
-                    CurrencyDecode::InvalidRecord(e) => {
-                        anyhow::bail!("Invalid currency record for {currency_code}: {e}");
-                    }
-                    CurrencyDecode::Undecodable(e) => {
-                        log::error!(
-                            "Skipping currency {currency_code}: {e}; payloads denominated in it will not decode"
+            anyhow::ensure!(!code.is_empty(), "Invalid currency key '{key}'");
+            let currency_code = Ustr::from(code);
+            let value_bytes = value_opt
+                .as_ref()
+                .with_context(|| format!("missing value for Redis currency key '{key}'"))?;
+
+            match Self::decode_currency(encoding, value_bytes, currency_code) {
+                CurrencyDecode::Currency(currency) => {
+                    // The key names the code the dependents resolve, so a record filed under
+                    // another code would register one currency and index another.
+                    if currency.code != currency_code {
+                        anyhow::bail!(
+                            "Currency record under key {currency_code} holds code {}",
+                            currency.code
                         );
                     }
+
+                    currencies.insert(currency_code, currency);
                 }
-            } else {
-                log::error!("Currency not found in Redis: {currency_code}");
+                CurrencyDecode::InvalidRecord(e) => {
+                    anyhow::bail!("Invalid currency record for {currency_code}: {e}");
+                }
+                CurrencyDecode::Undecodable(e) => {
+                    log::error!(
+                        "Skipping currency {currency_code}: {e}; payloads denominated in it will not decode"
+                    );
+                }
             }
         }
 
@@ -1012,66 +1025,21 @@ impl DatabaseQueries {
     ///
     /// # Errors
     ///
-    /// Returns an error if scanning keys or reading instrument data fails.
-    /// Loads all instruments for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading instrument data fails.
+    /// Returns an error if scanning keys or restoring any discovered instrument fails.
     pub async fn load_instruments(
         con: &ConnectionManager,
         trader_key: &str,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<AHashMap<InstrumentId, InstrumentAny>> {
-        let mut instruments = AHashMap::new();
-        let prefix = format!("{trader_key}{REDIS_DELIMITER}{INSTRUMENTS}{REDIS_DELIMITER}");
-        let pattern = format!("{prefix}*");
-        log::debug!("Loading {pattern}");
-
-        let mut con = con.clone();
-        let keys = Self::scan_keys(&mut con, pattern).await?;
-
-        let futures: Vec<_> = keys
-            .iter()
-            .map(|key| {
-                let con = con.clone();
-                let prefix = &prefix;
-                async move {
-                    let instrument_id = parse_instrument_key(key, prefix);
-
-                    let Ok(instrument_id) = instrument_id else {
-                        log::error!("Failed to parse InstrumentId from Redis key: {key}");
-                        return Ok::<_, anyhow::Error>(None);
-                    };
-
-                    match Self::load_instrument(&con, trader_key, &instrument_id, encoding).await {
-                        Ok(Some(instrument)) => Ok(Some((instrument_id, instrument))),
-                        Ok(None) => {
-                            log::error!("Instrument not found: {instrument_id}");
-                            Ok(None)
-                        }
-                        Err(e) => {
-                            #[cfg(feature = "defi")]
-                            if e.is::<crate::defi::IntegrityError>() {
-                                return Err(e);
-                            }
-
-                            log::error!("Failed to load instrument {instrument_id}: {e}");
-                            Ok(None)
-                        }
-                    }
-                }
-            })
-            .collect();
-
-        // Insert all Instrument_id (key) and Instrument (value) into the HashMap, filtering out None values.
-        for result in join_all(futures).await {
-            instruments.extend(result?);
-        }
-
-        log::debug!("Loaded {} instruments(s)", instruments.len());
-
-        Ok(instruments)
+        Self::load_collection(
+            con,
+            trader_key,
+            INSTRUMENTS,
+            parse_instrument_key,
+            |id| async move { Self::load_instrument(con, trader_key, &id, encoding).await },
+            Instrument::id,
+        )
+        .await
     }
 
     /// Loads all instrument closes for `trader_key`.
@@ -1125,216 +1093,131 @@ impl DatabaseQueries {
     ///
     /// # Errors
     ///
-    /// Returns an error if scanning keys or reading synthetic instrument data fails.
+    /// Returns an error if scanning keys or restoring any discovered synthetic fails.
     pub async fn load_synthetics(
         con: &ConnectionManager,
         trader_key: &str,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<AHashMap<InstrumentId, SyntheticInstrument>> {
-        let mut synthetics = AHashMap::new();
-        let prefix = format!("{trader_key}{REDIS_DELIMITER}{SYNTHETICS}{REDIS_DELIMITER}");
-        let pattern = format!("{prefix}*");
-        log::debug!("Loading {pattern}");
-
-        let mut con = con.clone();
-        let keys = Self::scan_keys(&mut con, pattern).await?;
-
-        let futures: Vec<_> = keys
-            .iter()
-            .map(|key| {
-                let con = con.clone();
-                let prefix = &prefix;
-                async move {
-                    let instrument_id = match parse_instrument_key(key, prefix) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            log::error!("Failed to parse InstrumentId from Redis key: {e}");
-                            return None;
-                        }
-                    };
-
-                    match Self::load_synthetic(&con, trader_key, &instrument_id, encoding).await {
-                        Ok(Some(synthetic)) => Some((instrument_id, synthetic)),
-                        Ok(None) => {
-                            log::error!("Synthetic not found: {instrument_id}");
-                            None
-                        }
-                        Err(e) => {
-                            log::error!("Failed to load synthetic {instrument_id}: {e}");
-                            None
-                        }
-                    }
-                }
-            })
-            .collect();
-
-        // Insert all Instrument_id (key) and Synthetic (value) into the HashMap, filtering out None values.
-        synthetics.extend(join_all(futures).await.into_iter().flatten());
-        log::debug!("Loaded {} synthetics(s)", synthetics.len());
-
-        Ok(synthetics)
+        Self::load_collection(
+            con,
+            trader_key,
+            SYNTHETICS,
+            parse_instrument_key,
+            |id| async move { Self::load_synthetic(con, trader_key, &id, encoding).await },
+            |synthetic| synthetic.id,
+        )
+        .await
     }
 
     /// Loads all accounts for `trader_key` using the specified `encoding`.
     ///
     /// # Errors
     ///
-    /// Returns an error if scanning keys or reading account data fails.
+    /// Returns an error if scanning keys or restoring any discovered account fails.
     pub async fn load_accounts(
         con: &ConnectionManager,
         trader_key: &str,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<AHashMap<AccountId, AccountAny>> {
-        let mut accounts = AHashMap::new();
-        let prefix = format!("{trader_key}{REDIS_DELIMITER}{ACCOUNTS}{REDIS_DELIMITER}");
-        let pattern = format!("{prefix}*");
-        log::debug!("Loading {pattern}");
-
-        let mut con = con.clone();
-        let keys = Self::scan_keys(&mut con, pattern).await?;
-
-        let futures: Vec<_> = keys
-            .iter()
-            .map(|key| {
-                let con = con.clone();
-                let prefix = &prefix;
-                async move {
-                    let account_id = match parse_account_key(key, prefix) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            log::error!("Failed to parse AccountId from Redis key: {e}");
-                            return None;
-                        }
-                    };
-
-                    match Self::load_account(&con, trader_key, &account_id, encoding).await {
-                        Ok(Some(account)) => Some((account_id, account)),
-                        Ok(None) => {
-                            log::error!("Account not found: {account_id}");
-                            None
-                        }
-                        Err(e) => {
-                            log::error!("Failed to load account {account_id}: {e}");
-                            None
-                        }
-                    }
-                }
-            })
-            .collect();
-
-        // Insert all Account_id (key) and Account (value) into the HashMap, filtering out None values.
-        accounts.extend(join_all(futures).await.into_iter().flatten());
-        log::debug!("Loaded {} accounts(s)", accounts.len());
-
-        Ok(accounts)
+        Self::load_collection(
+            con,
+            trader_key,
+            ACCOUNTS,
+            parse_account_key,
+            |id| async move { Self::load_account(con, trader_key, &id, encoding).await },
+            AccountAny::id,
+        )
+        .await
     }
 
     /// Loads all orders for `trader_key` using the specified `encoding`.
     ///
     /// # Errors
     ///
-    /// Returns an error if scanning keys or reading order data fails.
+    /// Returns an error if scanning keys or restoring any discovered order fails.
     pub async fn load_orders(
         con: &ConnectionManager,
         trader_key: &str,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<AHashMap<ClientOrderId, OrderAny>> {
-        let mut orders = AHashMap::new();
-        let prefix = format!("{trader_key}{REDIS_DELIMITER}{ORDERS}{REDIS_DELIMITER}");
-        let pattern = format!("{prefix}*");
-        log::debug!("Loading {pattern}");
-
-        let mut con = con.clone();
-        let keys = Self::scan_keys(&mut con, pattern).await?;
-
-        let futures: Vec<_> = keys
-            .iter()
-            .map(|key| {
-                let con = con.clone();
-                let prefix = &prefix;
-                async move {
-                    let client_order_id = match parse_order_key(key, prefix) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            log::error!("Failed to parse ClientOrderId from Redis key: {e}");
-                            return None;
-                        }
-                    };
-
-                    match Self::load_order(&con, trader_key, &client_order_id, encoding).await {
-                        Ok(Some(order)) => Some((client_order_id, order)),
-                        Ok(None) => {
-                            log::error!("Order not found: {client_order_id}");
-                            None
-                        }
-                        Err(e) => {
-                            log::error!("Failed to load order {client_order_id}: {e}");
-                            None
-                        }
-                    }
-                }
-            })
-            .collect();
-
-        // Insert all Client-Order-Id (key) and Order (value) into the HashMap, filtering out None values.
-        orders.extend(join_all(futures).await.into_iter().flatten());
-        log::debug!("Loaded {} order(s)", orders.len());
-
-        Ok(orders)
+        Self::load_collection(
+            con,
+            trader_key,
+            ORDERS,
+            parse_order_key,
+            |id| async move { Self::load_order(con, trader_key, &id, encoding).await },
+            Order::client_order_id,
+        )
+        .await
     }
 
     /// Loads all positions for `trader_key` using the specified `encoding`.
     ///
     /// # Errors
     ///
-    /// Returns an error if scanning keys or reading position data fails.
+    /// Returns an error if scanning keys or restoring any discovered position fails.
     pub async fn load_positions(
         con: &ConnectionManager,
         trader_key: &str,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<AHashMap<PositionId, Position>> {
-        let mut positions = AHashMap::new();
-        let prefix = format!("{trader_key}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}");
+        Self::load_collection(
+            con,
+            trader_key,
+            POSITIONS,
+            parse_position_key,
+            |id| async move { Self::load_position(con, trader_key, &id, encoding).await },
+            |position| position.id,
+        )
+        .await
+    }
+
+    async fn load_collection<K, V, F>(
+        con: &ConnectionManager,
+        trader_key: &str,
+        collection: &str,
+        parse_key: impl Fn(&str, &str) -> anyhow::Result<K>,
+        load: impl Fn(K) -> F,
+        record_id: impl Fn(&V) -> K,
+    ) -> anyhow::Result<AHashMap<K, V>>
+    where
+        K: Copy + Eq + Hash + Display,
+        F: Future<Output = anyhow::Result<Option<V>>>,
+    {
+        let prefix = format!("{trader_key}{REDIS_DELIMITER}{collection}{REDIS_DELIMITER}");
         let pattern = format!("{prefix}*");
         log::debug!("Loading {pattern}");
 
-        let mut con = con.clone();
-        let keys = Self::scan_keys(&mut con, pattern).await?;
+        let keys = Self::scan_keys(&mut con.clone(), pattern).await?;
+        let keys = keys.iter().filter(|key| key.starts_with(&prefix));
 
-        let futures: Vec<_> = keys
-            .iter()
-            .map(|key| {
-                let con = con.clone();
-                let prefix = &prefix;
-                async move {
-                    let position_id = match parse_position_key(key, prefix) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            log::error!("Failed to parse PositionId from Redis key: {e}");
-                            return None;
-                        }
-                    };
+        let records = try_join_all(keys.map(|key| {
+            let (prefix, parse_key, load, record_id) = (&prefix, &parse_key, &load, &record_id);
+            async move {
+                let id = parse_key(key, prefix)?;
+                // DEX pool IDs can normalize during parsing
+                let canonical_id = id.to_string();
+                anyhow::ensure!(
+                    key.strip_prefix(prefix) == Some(canonical_id.as_str()),
+                    "Redis cache key '{key}' does not match canonical ID '{canonical_id}'",
+                );
+                let record = load(id)
+                    .await
+                    .with_context(|| format!("failed to restore Redis cache key '{key}'"))?
+                    .with_context(|| format!("missing record for Redis cache key '{key}'"))?;
+                anyhow::ensure!(
+                    record_id(&record) == id,
+                    "Redis cache key '{key}' does not match the record ID",
+                );
+                Ok::<_, anyhow::Error>((id, record))
+            }
+        }))
+        .await?;
 
-                    match Self::load_position(&con, trader_key, &position_id, encoding).await {
-                        Ok(Some(position)) => Some((position_id, position)),
-                        Ok(None) => {
-                            log::error!("Position not found: {position_id}");
-                            None
-                        }
-                        Err(e) => {
-                            log::error!("Failed to load position {position_id}: {e}");
-                            None
-                        }
-                    }
-                }
-            })
-            .collect();
-
-        // Insert all Position_id (key) and Position (value) into the HashMap, filtering out None values.
-        positions.extend(join_all(futures).await.into_iter().flatten());
-        log::debug!("Loaded {} position(s)", positions.len());
-
-        Ok(positions)
+        let records: AHashMap<_, _> = records.into_iter().collect();
+        log::debug!("Loaded {} {collection}", records.len());
+        Ok(records)
     }
 
     /// Loads the order ID to position ID index for `trader_key`.
@@ -1582,18 +1465,107 @@ impl DatabaseQueries {
         account_id: &AccountId,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<Option<AccountAny>> {
-        let key = format!("{ACCOUNTS}{REDIS_DELIMITER}{account_id}");
-        let result = Self::read(con, trader_key, &key).await?;
-        if result.is_empty() {
+        let key = account_key(trader_key, *account_id);
+        let rows = Self::read_list(&mut con.clone(), &key).await?;
+        Self::replay_account(&rows, encoding, &key, *account_id)
+    }
+
+    pub(super) fn account_event_id(
+        encoding: SerializationEncoding,
+        payload: &[u8],
+        key: &str,
+        id: AccountId,
+    ) -> anyhow::Result<UUID4> {
+        let event: AccountEventIdentity = Self::deserialize_payload(encoding, payload)?;
+        check_account_id(key, id, event.account_id)?;
+        Ok(event.event_id)
+    }
+
+    pub(super) fn compact_account_events(
+        rows: &[Bytes],
+        config: &CacheConfig,
+        key: &str,
+        id: AccountId,
+        ts_now: UnixNanos,
+        lookback_secs: u64,
+    ) -> anyhow::Result<Option<Vec<Vec<u8>>>> {
+        let encoding = config.encoding;
+
+        let Some(mut account) = Self::replay_account(rows, encoding, key, id)? else {
+            return Ok(None);
+        };
+
+        let distinct_count = account.event_count();
+        let stored_events = event_payloads(rows);
+        account.purge_account_events(ts_now, lookback_secs);
+        let retained = account.events();
+        if retained.len() == stored_events.len() {
             return Ok(None);
         }
 
-        let events: Vec<AccountState> = result
-            .iter()
-            .map(|payload| Self::deserialize_payload(encoding, payload))
-            .collect::<anyhow::Result<_>>()?;
-        let account = AccountAny::from_events(&events)?;
-        Ok(Some(account))
+        let mut replacement = Vec::with_capacity(retained.len() + 1);
+        if retained.len() == distinct_count && stored_events.len() == rows.len() {
+            // A full replay needs the original inputs before it adds synthetic zero balances
+            let mut seen = AHashSet::with_capacity(distinct_count);
+
+            for payload in stored_events {
+                let event_id = Self::account_event_id(encoding, payload, key, id)?;
+                if seen.insert(event_id) {
+                    replacement.push(payload.to_vec());
+                }
+            }
+
+            return Ok(Some(replacement));
+        }
+
+        let checkpoint = AccountCheckpoint::new(&account, &retained)?;
+        let mut payload = CHECKPOINT_TAG.to_vec();
+        payload.extend(Self::serialize_payload_with_timestamps(
+            encoding,
+            &checkpoint,
+            config.timestamps_as_iso8601,
+        )?);
+        replacement.push(payload);
+        for event in retained {
+            replacement.push(Self::serialize_payload_with_timestamps(
+                encoding,
+                &event,
+                config.timestamps_as_iso8601,
+            )?);
+        }
+
+        Ok(Some(replacement))
+    }
+
+    fn replay_account(
+        rows: &[Bytes],
+        encoding: SerializationEncoding,
+        key: &str,
+        id: AccountId,
+    ) -> anyhow::Result<Option<AccountAny>> {
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let payloads = event_payloads(rows);
+        let mut seen = AHashSet::with_capacity(payloads.len());
+        let mut events = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let event: AccountState = Self::deserialize_payload(encoding, payload)?;
+            check_account_id(key, id, event.account_id)?;
+            if seen.insert(event.event_id) {
+                events.push(event);
+            }
+        }
+
+        if let Some(payload) = rows[0].strip_prefix(CHECKPOINT_TAG) {
+            let checkpoint: AccountCheckpoint = Self::deserialize_payload(encoding, payload)?;
+            check_account_id(key, id, checkpoint.starting.account_id)?;
+            check_account_id(key, id, checkpoint.current.account_id)?;
+            checkpoint.replay(events).map(Some)
+        } else {
+            AccountAny::from_events(&events).map(Some)
+        }
     }
 
     /// Loads a single order for `trader_key` and `client_order_id` using the specified `encoding`.
@@ -1607,13 +1579,41 @@ impl DatabaseQueries {
         client_order_id: &ClientOrderId,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<Option<OrderAny>> {
-        let key = format!("{ORDERS}{REDIS_DELIMITER}{client_order_id}");
-        let result = Self::read(con, trader_key, &key).await?;
+        let key =
+            format!("{trader_key}{REDIS_DELIMITER}{ORDERS}{REDIS_DELIMITER}{client_order_id}");
+        let activations = format!("{trader_key}{REDIS_DELIMITER}{ORDER_ACTIVATIONS}");
+        let mut con = con.clone();
+        let (result, activation): (Vec<Bytes>, Option<Bytes>) = redis::pipe()
+            .atomic()
+            .lrange(&key, 0, -1)
+            .hget(activations, &key)
+            .query_async(&mut con)
+            .await?;
+
         if result.is_empty() {
             return Ok(None);
         }
 
-        let order = Self::deserialize_order(encoding, &result)?;
+        let mut order = Self::deserialize_order(encoding, &result)?;
+        if let Some(payload) = activation {
+            let init_id = order.init_id();
+            let (price, is_activated) = match &mut order {
+                OrderAny::TrailingStopMarket(order) => {
+                    (&mut order.activation_price, &mut order.is_activated)
+                }
+                OrderAny::TrailingStopLimit(order) => {
+                    (&mut order.activation_price, &mut order.is_activated)
+                }
+                _ => return Ok(Some(order)),
+            };
+
+            let activation: OrderActivationRecord = Self::deserialize_payload(encoding, &payload)?;
+            if activation.init_id == init_id {
+                *price = Some(activation.activation_price);
+                *is_activated = true;
+            }
+        }
+
         Ok(Some(order))
     }
 
@@ -1645,7 +1645,8 @@ impl DatabaseQueries {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying read or deserialization fails.
+    /// Returns an error if reading or replaying the position fails, including when a required
+    /// snapshot or instrument is missing.
     pub async fn load_position(
         con: &ConnectionManager,
         trader_key: &str,
@@ -1676,7 +1677,9 @@ impl DatabaseQueries {
             }
 
             if read_snapshots && uses_snapshot != Some(false) {
-                if let Some(position) = Self::decode_position_replay(encoding, &payloads)? {
+                if let Some(position) =
+                    Self::decode_position_replay(*position_id, encoding, &payloads)?
+                {
                     return Ok(Some(position));
                 }
 
@@ -1700,10 +1703,16 @@ impl DatabaseQueries {
                 .await?;
 
             if uses_snapshot != Some(false)
-                && let Some(position) = Self::decode_position_replay(encoding, &snapshots)?
+                && let Some(position) =
+                    Self::decode_position_replay(*position_id, encoding, &snapshots)?
             {
                 return Ok(Some(position));
             }
+
+            anyhow::ensure!(
+                uses_snapshot != Some(true),
+                "Missing replay snapshot for position {position_id}",
+            );
 
             fills
         };
@@ -1726,15 +1735,15 @@ impl DatabaseQueries {
             return Ok(None);
         };
 
-        let Some(instrument) =
-            Self::load_instrument(con, trader_key, &first_fill.instrument_id, encoding).await?
-        else {
-            log::error!(
-                "Instrument not found for position {position_id}: {}",
-                first_fill.instrument_id
-            );
-            return Ok(None);
-        };
+        let instrument =
+            Self::load_instrument(con, trader_key, &first_fill.instrument_id, encoding)
+                .await?
+                .with_context(|| {
+                    format!(
+                        "missing instrument {} for position {position_id}",
+                        first_fill.instrument_id
+                    )
+                })?;
 
         let mut position = Position::new_checked(&instrument, first_fill.clone())?;
         for fill in remaining_fills {
@@ -1752,6 +1761,7 @@ impl DatabaseQueries {
     }
 
     fn decode_position_replay(
+        position_id: PositionId,
         encoding: SerializationEncoding,
         snapshots: &[Bytes],
     ) -> anyhow::Result<Option<Position>> {
@@ -1760,6 +1770,19 @@ impl DatabaseQueries {
             if let Some(replay_state) = snapshot.replay_state {
                 let position: Position = serde_json::from_value(replay_state)
                     .map_err(|e| anyhow::anyhow!("Failed to decode position replay state: {e}"))?;
+                anyhow::ensure!(
+                    snapshot.position_id == position_id,
+                    "Redis replay snapshot for position {position_id} contains position {}",
+                    snapshot.position_id,
+                );
+                anyhow::ensure!(
+                    position.id == snapshot.position_id && position.trader_id == snapshot.trader_id,
+                    "Position replay state for {}/{} contains {}/{}",
+                    snapshot.trader_id,
+                    snapshot.position_id,
+                    position.trader_id,
+                    position.id,
+                );
                 position.check_accounting()?;
                 return Ok(Some(position));
             }
@@ -1849,6 +1872,111 @@ fn deserialize_payload_value<T: DeserializeOwned>(mut value: Value) -> anyhow::R
 
     serde_json::from_value(value)
         .map_err(|e| anyhow::anyhow!("Failed to convert value to target type: {e}"))
+}
+
+pub(super) fn account_key(trader_key: &str, id: AccountId) -> String {
+    format!("{trader_key}:{ACCOUNTS}:{id}")
+}
+
+fn check_account_id(key: &str, id: AccountId, account_id: AccountId) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        id == account_id,
+        "Redis cache key '{key}' does not match the record ID '{account_id}'",
+    );
+    Ok(())
+}
+
+fn event_payloads(rows: &[Bytes]) -> &[Bytes] {
+    if rows
+        .first()
+        .is_some_and(|row| row.starts_with(CHECKPOINT_TAG))
+    {
+        &rows[1..]
+    } else {
+        rows
+    }
+}
+
+#[derive(Deserialize)]
+struct AccountEventIdentity {
+    account_id: AccountId,
+    event_id: UUID4,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AccountCheckpoint {
+    covered: usize,
+    starting: AccountState,
+    current: AccountState,
+}
+
+impl AccountCheckpoint {
+    fn new(account: &AccountAny, events: &[AccountState]) -> anyhow::Result<Self> {
+        let mut current = events
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Cannot checkpoint an account without events"))?;
+        current.account_type = account.account_type();
+        current.base_currency = account.base_currency();
+        current.balances = account.balances().into_values().collect();
+        current.margins = match account {
+            AccountAny::Margin(margin) => margin
+                .margins
+                .values()
+                .chain(margin.account_margins.values())
+                .copied()
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        current.info = None;
+
+        // AccountState preserves inline currency identities for wallet balances
+        let mut starting = current.clone();
+        starting.margins.clear();
+        starting.balances = account
+            .starting_balances()
+            .into_values()
+            .map(|total| AccountBalance::new(total, Money::zero(total.currency), total))
+            .collect();
+        Ok(Self {
+            covered: events.len(),
+            starting,
+            current,
+        })
+    }
+
+    fn replay(self, mut events: Vec<AccountState>) -> anyhow::Result<AccountAny> {
+        anyhow::ensure!(
+            self.covered > 0 && self.covered <= events.len(),
+            "Invalid Redis account checkpoint event count",
+        );
+        let suffix = events.split_off(self.covered);
+        let mut account = AccountAny::try_from_state(self.current).map_err(anyhow::Error::msg)?;
+        let base = account_base(&mut account);
+        base.balances_starting = self
+            .starting
+            .balances
+            .into_iter()
+            .map(|balance| (balance.currency, balance.total))
+            .collect();
+        base.events = Arc::new(events);
+
+        for event in suffix {
+            account.apply(event)?;
+        }
+
+        Ok(account)
+    }
+}
+
+fn account_base(account: &mut AccountAny) -> &mut BaseAccount {
+    match account {
+        AccountAny::Margin(account) => &mut account.base,
+        AccountAny::Cash(account) => &mut account.base,
+        AccountAny::Betting(account) => &mut account.base,
+        AccountAny::Wallet(account) => &mut account.base,
+    }
 }
 
 fn normalize_account_state(value: &mut Value) {
@@ -1985,13 +2113,14 @@ mod tests {
     use std::{hint::black_box, str::FromStr, time::Instant};
 
     use bytes::Bytes;
-    use nautilus_common::enums::SerializationEncoding;
+    use nautilus_common::{cache::CacheConfig, enums::SerializationEncoding};
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
         data::{Data, stubs::stub_custom_data},
         enums::{AccountType, CurrencyType, OrderType},
         events::{
             AccountState, OrderEventAny, OrderInitialized,
+            account::stubs::cash_account_state_multi,
             order::spec::{OrderFillVoidedSpec, OrderFilledSpec},
         },
         identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, TradeId},
@@ -2005,9 +2134,63 @@ mod tests {
     use ustr::Ustr;
 
     use super::{
-        CurrencyDecode, CurrencyRecord, DatabaseQueries, parse_account_key, parse_instrument_key,
-        parse_order_key, parse_position_key,
+        CHECKPOINT_TAG, CurrencyDecode, CurrencyRecord, DatabaseQueries, parse_account_key,
+        parse_instrument_key, parse_order_key, parse_position_key,
     };
+
+    #[rstest]
+    #[case(false, "2")]
+    #[case(true, "1970-01-01T00:00:00.000000002Z")]
+    fn test_account_checkpoint_uses_configured_timestamp_format(
+        #[case] timestamps_as_iso8601: bool,
+        #[case] expected: &str,
+    ) {
+        let config = CacheConfig {
+            timestamps_as_iso8601,
+            ..Default::default()
+        };
+
+        let mut initial = cash_account_state_multi();
+        initial.ts_event = UnixNanos::from(1);
+        let id = initial.account_id;
+        let mut update = initial.clone();
+        update.event_id = UUID4::new();
+        update.ts_event = UnixNanos::from(2);
+
+        let rows = [initial, update].map(|event| {
+            Bytes::from(
+                DatabaseQueries::serialize_payload_with_timestamps(
+                    config.encoding,
+                    &event,
+                    timestamps_as_iso8601,
+                )
+                .unwrap(),
+            )
+        });
+
+        let replacement = DatabaseQueries::compact_account_events(
+            &rows,
+            &config,
+            &format!("trader-test:accounts:{id}"),
+            id,
+            UnixNanos::from(1),
+            0,
+        )
+        .unwrap()
+        .unwrap();
+
+        let [checkpoint, event] = replacement.as_slice() else {
+            panic!("Expected a checkpoint and one retained event");
+        };
+
+        let checkpoint: serde_json::Value =
+            serde_json::from_slice(checkpoint.strip_prefix(CHECKPOINT_TAG).unwrap()).unwrap();
+        let event: serde_json::Value = serde_json::from_slice(event).unwrap();
+
+        assert_eq!(checkpoint["starting"]["ts_event"].as_str(), Some(expected));
+        assert_eq!(checkpoint["current"]["ts_event"].as_str(), Some(expected));
+        assert_eq!(event["ts_event"].as_str(), Some(expected));
+    }
 
     #[rstest]
     #[case(SerializationEncoding::Json)]

@@ -16,6 +16,9 @@
 //! Live execution client implementation for the Hyperliquid adapter.
 
 use std::{
+    cell::RefCell,
+    future::Future,
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -32,6 +35,7 @@ use nautilus_common::{
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
         ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
     },
+    msgbus::{InstrumentSubscription, TypedHandler, switchboard::get_instruments_pattern},
 };
 use nautilus_core::{
     DurationNanos, Params, UUID4, UnixNanos,
@@ -58,6 +62,7 @@ use nautilus_model::{
 };
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
+use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use crate::{
@@ -119,7 +124,8 @@ pub struct HyperliquidExecutionClient {
     emitter: ExecutionEventEmitter,
     http_client: HyperliquidHttpClient,
     ws_client: HyperliquidWebSocketClient,
-    instruments_pending: Vec<InstrumentAny>,
+    instrument_subscription: Option<InstrumentSubscription>,
+    instruments_pending: Rc<RefCell<Option<Vec<InstrumentAny>>>>,
     session_tasks: TaskGroup,
     pending_tasks: TaskGroup,
     shutdown_errors: Vec<String>,
@@ -488,7 +494,8 @@ impl HyperliquidExecutionClient {
             emitter,
             http_client,
             ws_client,
-            instruments_pending: Vec::new(),
+            instrument_subscription: None,
+            instruments_pending: Rc::new(RefCell::new(Some(Vec::new()))),
             session_tasks,
             pending_tasks,
             shutdown_errors: Vec::new(),
@@ -498,11 +505,12 @@ impl HyperliquidExecutionClient {
         })
     }
 
-    async fn ensure_instruments_initialized_async(&mut self) -> anyhow::Result<()> {
-        if self.core.instruments_initialized() {
+    async fn ensure_instruments_initialized_async(&self) -> anyhow::Result<()> {
+        if self.instruments_pending.borrow().is_none() {
             return Ok(());
         }
 
+        let requested_at = self.clock.get_time_ns();
         let instruments = self
             .http_client
             .request_instruments()
@@ -517,13 +525,17 @@ impl HyperliquidExecutionClient {
             log::debug!("Initialized {} instruments", instruments.len());
         }
 
-        // Preserve arrival order for spot aliases, then let fetched definitions replace updates
-        let mut pending = std::mem::take(&mut self.instruments_pending);
-        pending.extend(instruments);
-        self.http_client.merge_instruments(&pending);
-        self.ws_client.merge_instruments(&pending);
+        let (mut earlier, later): (Vec<_>, Vec<_>) = self
+            .instruments_pending
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .partition(|instrument| instrument.ts_init() <= requested_at);
+        earlier.extend(instruments);
+        earlier.extend(later);
+        self.http_client.merge_instruments(&earlier);
+        self.ws_client.merge_instruments(&earlier);
 
-        self.core.set_instruments_initialized();
         Ok(())
     }
 
@@ -624,8 +636,10 @@ impl HyperliquidExecutionClient {
 
     fn report_client(&self) -> anyhow::Result<HyperliquidReportClient> {
         // Reports can be collected before connect() initializes the transport caches
-        self.http_client
-            .merge_instruments(&self.instruments_pending);
+        if let Some(pending) = self.instruments_pending.borrow().as_ref() {
+            self.http_client.merge_instruments(pending);
+        }
+
         Ok(HyperliquidReportClient {
             http_client: self.http_client.clone(),
             account_address: self.get_account_address()?,
@@ -685,35 +699,11 @@ impl HyperliquidExecutionClient {
         let ws_client = self.ws_client.clone();
         let clock = self.clock;
         let cancellation = self.session_tasks.cancellation_token();
-
         self.session_tasks.spawn(async move {
-            let mut interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + refresh_interval,
-                refresh_interval,
-            );
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => break,
-                    _ = interval.tick() => {}
-                }
-
-                if !ws_client.is_active() {
-                    continue;
-                }
-
-                tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => break,
-                    result = refresh_scheduled_cancel(&http_client, clock, timeout, refresh_interval) => {
-                        if let Err(e) = result {
-                            log::error!("Scheduled cancellation refresh failed; the last deadline may expire: {e:#}");
-                        }
-                    }
-                }
-            }
+            run_scheduled_cancel_refresh(refresh_interval, &cancellation, &ws_client, || {
+                refresh_scheduled_cancel(&http_client, clock, timeout, refresh_interval)
+            })
+            .await;
         })?;
 
         log::info!("Scheduled cancellation armed: timeout_secs={timeout_secs}");
@@ -863,6 +853,51 @@ impl HyperliquidExecutionClient {
     }
 }
 
+impl HyperliquidExecutionClient {
+    fn subscribe_instruments(&mut self) {
+        if self.instrument_subscription.is_some() {
+            return;
+        }
+
+        let http_client = self.http_client.clone();
+        let ws_client = self.ws_client.clone();
+        let instruments_pending = Rc::clone(&self.instruments_pending);
+        self.instrument_subscription = Some(InstrumentSubscription::new(
+            get_instruments_pattern(self.venue()),
+            TypedHandler::from(move |instrument: &InstrumentAny| {
+                Self::apply_instrument(
+                    &http_client,
+                    &ws_client,
+                    &instruments_pending,
+                    instrument.clone(),
+                );
+            }),
+        ));
+    }
+
+    fn apply_instrument(
+        http_client: &HyperliquidHttpClient,
+        ws_client: &HyperliquidWebSocketClient,
+        instruments_pending: &RefCell<Option<Vec<InstrumentAny>>>,
+        instrument: InstrumentAny,
+    ) {
+        if let Some(pending) = instruments_pending.borrow_mut().as_mut() {
+            // Batch the startup drain to avoid cloning growing caches for every instrument
+            pending.push(instrument);
+            return;
+        }
+
+        // this is the only step that makes a market listed after our bootstrap
+        // submittable, so it is traceable rather than silent
+        log::debug!(
+            "Applying instrument update: instrument_id={}",
+            instrument.id()
+        );
+        http_client.cache_instrument(&instrument);
+        ws_client.cache_instrument(instrument);
+    }
+}
+
 #[async_trait(?Send)]
 impl ExecutionClient for HyperliquidExecutionClient {
     fn provides_bulk_position_coverage(&self, instrument_id: InstrumentId) -> bool {
@@ -915,23 +950,17 @@ impl ExecutionClient for HyperliquidExecutionClient {
     /// map. WebSocket submissions sign through `&self.http_client`, so that one
     /// write serves both submission paths.
     fn on_instrument(&mut self, instrument: InstrumentAny) {
-        if !self.core.instruments_initialized() {
-            // Batch the startup drain to avoid cloning growing caches for every instrument
-            self.instruments_pending.push(instrument);
-            return;
-        }
-
-        // this is the only step that makes a market listed after our bootstrap
-        // submittable, so it is traceable rather than silent
-        log::debug!(
-            "Applying instrument update: instrument_id={}",
-            instrument.id()
+        Self::apply_instrument(
+            &self.http_client,
+            &self.ws_client,
+            &self.instruments_pending,
+            instrument,
         );
-        self.http_client.cache_instrument(&instrument);
-        self.ws_client.cache_instrument(instrument);
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_instruments();
+
         if self.core.is_started() {
             return Ok(());
         }
@@ -953,6 +982,8 @@ impl ExecutionClient for HyperliquidExecutionClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        self.instrument_subscription.take();
+
         if self.core.is_stopped() {
             return Ok(());
         }
@@ -2130,6 +2161,8 @@ impl ExecutionClient for HyperliquidExecutionClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
+        self.subscribe_instruments();
+
         if self.core.is_connected() && self.pending_tasks.is_open() && self.session_tasks.is_open()
         {
             return Ok(());
@@ -2338,8 +2371,10 @@ impl ExecutionClient for HyperliquidExecutionClient {
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let ts_init = self.clock.get_time_ns();
         let account_address = self.get_account_address()?;
-        self.http_client
-            .merge_instruments(&self.instruments_pending);
+
+        if let Some(pending) = self.instruments_pending.borrow().as_ref() {
+            self.http_client.merge_instruments(pending);
+        }
 
         let lookback_start = lookback_mins
             .map(DurationNanos::try_from_mins)
@@ -3173,6 +3208,43 @@ fn emit_account_state(
             .context("failed to parse combined account balances and margins")?;
     emitter.emit_account_state(balances, margins, true, ts_event, None);
     Ok(())
+}
+
+async fn run_scheduled_cancel_refresh<F>(
+    refresh_interval: Duration,
+    cancellation: &CancellationToken,
+    ws_client: &HyperliquidWebSocketClient,
+    mut refresh: impl FnMut() -> F,
+) where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + refresh_interval,
+        refresh_interval,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => break,
+            _ = interval.tick() => {}
+        }
+
+        if !ws_client.is_active() {
+            continue;
+        }
+
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => break,
+            result = refresh() => {
+                if let Err(e) = result {
+                    log::error!("Scheduled cancellation refresh failed; the last deadline may expire: {e:#}");
+                }
+            }
+        }
+    }
 }
 
 async fn refresh_scheduled_cancel(
@@ -5015,7 +5087,12 @@ use crate::common::parse::determine_order_list_grouping;
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        sync::Arc,
+        time::Duration,
+    };
 
     use alloy::signers::local::PrivateKeySigner;
     use axum::{
@@ -5032,6 +5109,8 @@ mod tests {
         cache::Cache,
         clock::VirtualClock,
         messages::{ExecutionEvent, ExecutionReport as EngineExecutionReport},
+        msgbus::{publish_instrument, switchboard::get_instrument_topic},
+        testing::wait_until_async,
     };
     use nautilus_core::{
         DurationNanos, UUID4, UnixNanos,
@@ -5077,8 +5156,8 @@ mod tests {
         WsDispatchState, attach_known_client_order_id, build_ouo_resize_request,
         can_fast_cancel_order, classify_post_failure, determine_order_list_grouping,
         handle_execution_report, reconnect_reports_from_history, register_order_context_into,
-        resolve_order_legs, split_fast_cancel_requests, ts_venue, validate_order_for_hyperliquid,
-        validate_query_order_fills,
+        resolve_order_legs, run_scheduled_cancel_refresh, split_fast_cancel_requests, ts_venue,
+        validate_order_for_hyperliquid, validate_query_order_fills,
     };
     use crate::{
         common::{
@@ -5100,6 +5179,107 @@ mod tests {
 
     const TEST_INSTRUMENT_ID: &str = "BTC-USD-PERP.HYPERLIQUID";
     const BOOTSTRAP_DELAY: DurationNanos = DurationNanos::from_secs(60);
+
+    #[rstest]
+    #[case::disconnect(false)]
+    #[case::stop(true)]
+    #[tokio::test]
+    async fn scheduled_cancel_refresh_skips_outage_and_continues_after_failure(#[case] stop: bool) {
+        let upgrades = Arc::new(tokio::sync::Semaphore::new(1));
+        let (attempted, mut handshakes) = tokio::sync::mpsc::unbounded_channel();
+        let permits = Arc::clone(&upgrades);
+        let app = Router::new().route(
+            "/ws",
+            get(move |upgrade: WebSocketUpgrade| {
+                let permits = Arc::clone(&permits);
+                let attempted = attempted.clone();
+                async move {
+                    attempted.send(()).unwrap();
+                    permits.acquire().await.unwrap().forget();
+                    upgrade.on_upgrade(|mut socket| async move {
+                        while let Some(Ok(_)) = socket.next().await {}
+                    })
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut client = make_execution_client();
+
+        client.ws_client = HyperliquidWebSocketClient::new(
+            Some(format!("ws://{addr}/ws")),
+            HyperliquidEnvironment::Testnet,
+            None,
+            TransportBackend::default(),
+            None,
+        );
+
+        client.ws_client.connect().await.unwrap();
+        assert_eq!(handshakes.recv().await, Some(()));
+        assert!(client.ws_client.request_reconnect());
+        tokio::time::timeout(Duration::from_secs(5), handshakes.recv())
+            .await
+            .unwrap()
+            .expect("the venue received the reconnect handshake");
+        assert!(!client.ws_client.is_active());
+
+        client.core.set_started();
+        client.core.set_connected();
+        let cancellation = client.session_tasks.cancellation_token();
+        let ws_client = client.ws_client.clone();
+        let (attempts, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let interval = Duration::from_secs(5);
+        let attempt = Cell::new(0);
+
+        tokio::time::pause();
+
+        let refresh = run_scheduled_cancel_refresh(interval, &cancellation, &ws_client, || async {
+            let current = attempt.get() + 1;
+            attempt.set(current);
+            attempts.send(current).unwrap();
+            if current == 1 {
+                anyhow::bail!("simulated refresh failure");
+            }
+
+            Ok(())
+        });
+
+        let drive = async {
+            tokio::time::sleep(interval + Duration::from_millis(1)).await;
+            assert!(observed.try_recv().is_err());
+
+            tokio::time::resume();
+            upgrades.add_permits(1);
+            wait_until_async(|| async { ws_client.is_active() }, Duration::from_secs(5)).await;
+            tokio::time::pause();
+
+            assert_eq!(observed.recv().await, Some(1));
+            assert_eq!(observed.recv().await, Some(2));
+
+            tokio::time::resume();
+
+            if stop {
+                client.stop().unwrap();
+            } else {
+                client.disconnect().await.unwrap();
+            }
+
+            tokio::time::pause();
+            tokio::time::sleep(interval).await;
+            assert!(observed.try_recv().is_err());
+            tokio::time::resume();
+        };
+
+        tokio::time::timeout(interval * 5, async { tokio::join!(refresh, drive) })
+            .await
+            .unwrap();
+        server.abort();
+    }
 
     fn test_emitter() -> (
         ExecutionEventEmitter,
@@ -5274,8 +5454,10 @@ mod tests {
                 error.to_string(),
                 "failed to request Hyperliquid instruments"
             );
-            assert!(!client.core.instruments_initialized());
-            assert_eq!(client.instruments_pending.len(), 3);
+            assert_eq!(
+                client.instruments_pending.borrow().as_ref().unwrap().len(),
+                3
+            );
             assert!(client.ws_client.instruments_cache().is_empty());
             failing.store(false, std::sync::atomic::Ordering::Relaxed);
         }
@@ -5292,8 +5474,7 @@ mod tests {
         let snapshot = cache.load();
         let btc = snapshot.get(&Ustr::from("BTC")).unwrap();
 
-        assert!(client.core.instruments_initialized());
-        assert!(client.instruments_pending.is_empty());
+        assert!(client.instruments_pending.borrow().is_none());
         assert_eq!(snapshot.len(), if empty_universe { 2 } else { 4 });
         assert_eq!(client.http_client.get_asset_index("NEW-USD-PERP"), Some(42));
         assert_eq!(
@@ -5379,8 +5560,7 @@ mod tests {
             )
             .unwrap();
 
-            assert!(client.core.instruments_initialized());
-            assert!(client.instruments_pending.is_empty());
+            assert!(client.instruments_pending.borrow().is_none());
             assert!(client.ws_client.is_active());
             assert!(parsed.complete);
             assert_eq!(parsed.reports.len(), 1);
@@ -5402,10 +5582,9 @@ mod tests {
 
     #[rstest]
     fn test_on_instrument_registers_asset_index_for_a_new_market() {
-        // A market listed after the client bootstrapped arrives through the
-        // message bus, and must become submittable without a restart.
         let mut client = make_execution_client();
-        client.core.set_instruments_initialized();
+        client.instruments_pending.take();
+        client.subscribe_instruments();
         let meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
         let defs = parse_perp_instruments(&meta, 0).unwrap();
         let def = &defs[1];
@@ -5415,19 +5594,34 @@ mod tests {
             client.http_client.get_asset_index(def.symbol.as_str()),
             None
         );
-
-        client.on_instrument(instrument);
-
+        publish_instrument(get_instrument_topic(instrument.id()), &instrument);
         assert_eq!(
             client.http_client.get_asset_index(def.symbol.as_str()),
             Some(def.asset_index),
+        );
+
+        client.stop().unwrap();
+        let other = &defs[0];
+        let instrument = create_instrument_from_def(other, UnixNanos::default()).unwrap();
+        let topic = get_instrument_topic(instrument.id());
+        publish_instrument(topic, &instrument);
+        assert_eq!(
+            client.http_client.get_asset_index(other.symbol.as_str()),
+            None
+        );
+
+        client.subscribe_instruments();
+        publish_instrument(topic, &instrument);
+        assert_eq!(
+            client.http_client.get_asset_index(other.symbol.as_str()),
+            Some(other.asset_index),
         );
     }
 
     #[rstest]
     fn test_on_instrument_replaces_asset_index_and_precision() {
         let mut client = make_execution_client();
-        client.core.set_instruments_initialized();
+        client.instruments_pending.take();
         let meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
         let mut defs = parse_perp_instruments(&meta, 0).unwrap();
         let def = &mut defs[0];

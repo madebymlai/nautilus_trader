@@ -91,7 +91,6 @@ impl RequestLifecycle {
             .collect()
     }
 
-    #[cfg(feature = "python")]
     pub(super) fn is_current(&self, scope: &ResponseScope) -> bool {
         Rc::ptr_eq(&self.generation, &scope.generation)
     }

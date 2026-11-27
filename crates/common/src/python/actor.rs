@@ -7783,6 +7783,122 @@ class IndicatorEventActor:
         });
     }
 
+    #[rstest]
+    #[case::completes(
+        None,
+        "[('history', [10, 20]), ('quote', 30), ('quote', 40), ('response', True), ('callback',)]"
+    )]
+    #[case::cleanup_during_release(Some(30), "[('history', [10, 20]), ('quote', 30)]")]
+    fn test_python_update_subscriptions_request_releases_held_quotes_before_completion(
+        #[case] fault_at: Option<u64>,
+        #[case] expected: &str,
+        clock: Rc<RefCell<VirtualClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            *get_message_bus().borrow_mut() = MessageBus::default();
+            let actor = Py::new(py, create_registered_actor(clock, cache, trader_id)).unwrap();
+            let module = PyModule::from_code(
+                py,
+                c_str!(
+                    r#"
+class WarmupActor:
+    def __init__(self):
+        self.events = []
+        self.actor = None
+        self.fault_at = None
+    def on_start(self):
+        pass
+    def on_quote(self, quote):
+        self.events.append(("quote", quote.ts_event))
+        if quote.ts_event == self.fault_at:
+            self.actor.fault()
+    def on_historical_quotes(self, quotes):
+        self.events.append(("history", [quote.ts_event for quote in quotes]))
+    def on_data_response(self, response):
+        self.events.append(("response", response.completed))
+    def complete(self, request_id):
+        self.events.append(("callback",))
+"#
+                ),
+                c_str!("warmup_actor.py"),
+                c_str!("warmup_actor"),
+            )
+            .unwrap();
+            let tracker = module.getattr("WarmupActor").unwrap().call0().unwrap();
+            tracker.setattr("actor", actor.clone_ref(py)).unwrap();
+            tracker.setattr("fault_at", fault_at).unwrap();
+            actor.borrow_mut(py).set_python_instance(&tracker).unwrap();
+            actor.borrow(py).register_in_global_registries().unwrap();
+            let (handler, _) = get_typed_into_message_saving_handler::<DataCommand>(None);
+            msgbus::register_data_command_endpoint(
+                MessagingSwitchboard::data_engine_queue_execute(),
+                handler,
+            );
+            actor.bind(py).call_method0("start").unwrap();
+            let instrument_id = sample_quote().instrument_id;
+            actor
+                .bind(py)
+                .call_method1("subscribe_quotes", (instrument_id,))
+                .unwrap();
+            let params = PyDict::new(py);
+            params.set_item("update_subscriptions", true).unwrap();
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("params", params).unwrap();
+            kwargs
+                .set_item("callback", tracker.getattr("complete").unwrap())
+                .unwrap();
+            let root: UUID4 = actor
+                .bind(py)
+                .call_method("request_quotes", (instrument_id,), Some(&kwargs))
+                .unwrap()
+                .extract::<String>()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let quote_at = |ts: u64| {
+                QuoteTick::new(
+                    instrument_id,
+                    Price::from("1.00000"),
+                    Price::from("1.00001"),
+                    Quantity::from(100_000),
+                    Quantity::from(100_000),
+                    UnixNanos::from(ts),
+                    UnixNanos::from(ts),
+                )
+            };
+
+            msgbus::publish_quote(get_quotes_topic(instrument_id), &quote_at(30));
+            msgbus::publish_quote(get_quotes_topic(instrument_id), &quote_at(40));
+            let response = QuotesResponse::new(
+                root,
+                ClientId::new("HISTORY"),
+                instrument_id,
+                vec![quote_at(10), quote_at(20)],
+                None,
+                None,
+                UnixNanos::from(47),
+                None,
+            );
+            msgbus::send_response(
+                &root,
+                &crate::messages::data::DataResponse::Quotes(response),
+            );
+
+            assert_eq!(
+                tracker
+                    .getattr("events")
+                    .unwrap()
+                    .repr()
+                    .unwrap()
+                    .to_string(),
+                expected
+            );
+        });
+    }
+
     fn instrument_subscription_keywords<'py>(
         py: Python<'py>,
         family: &str,

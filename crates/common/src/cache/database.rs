@@ -37,7 +37,7 @@ use nautilus_model::{
     orderbook::OrderBook,
     orders::{Order, OrderAny},
     position::Position,
-    types::{Currency, Money},
+    types::{Currency, Money, Price},
 };
 use ustr::Ustr;
 
@@ -651,13 +651,37 @@ pub trait CacheDatabaseAdapter {
 
     /// Requests deletion of an account event from the database.
     ///
-    /// Redis and PostgreSQL retain the full account history for balance and margin replay;
-    /// their implementations log the request and return success without deleting it.
-    ///
     /// # Errors
     ///
     /// Returns an error if deleting account events fails.
     fn delete_account_event(&self, account_id: &AccountId, event_id: &str) -> anyhow::Result<()>;
+
+    /// Requests a purge of persisted events for one account.
+    ///
+    /// The default implementation calls [`Self::delete_account_event`] for each ID in
+    /// `removed_event_ids` and logs persistence failures. Adapters can override it to apply
+    /// the lookback in seconds to their stored history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a DeFi currency integrity check fails in the default implementation.
+    /// Adapters that override this method may return other errors.
+    fn purge_account_events(
+        &self,
+        account_id: &AccountId,
+        removed_event_ids: &[UUID4],
+        _ts_now: UnixNanos,
+        _lookback_secs: u64,
+    ) -> anyhow::Result<()> {
+        for event_id in removed_event_ids {
+            super::handle_persistence_result(
+                format_args!("delete account event {event_id}"),
+                self.delete_account_event(account_id, event_id.as_str()),
+            )?;
+        }
+
+        Ok(())
+    }
 
     /// Indexes a venue order ID with its client order ID.
     ///
@@ -737,6 +761,23 @@ pub trait CacheDatabaseAdapter {
     /// Returns an error if updating the order fails.
     fn update_order_from_state(&self, order: &OrderAny) -> anyhow::Result<()> {
         self.update_order(order.last_event())
+    }
+
+    /// Stores runtime trailing-stop activation for an order.
+    ///
+    /// Recovery applies the record only when `init_id` matches the order's initialization.
+    /// The default implementation leaves activation in memory only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if preparing, queueing, or writing the activation record fails.
+    fn store_trailing_stop_activation(
+        &self,
+        _client_order_id: ClientOrderId,
+        _init_id: UUID4,
+        _activation_price: Price,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Updates a position in the cache.

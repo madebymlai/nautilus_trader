@@ -33,7 +33,10 @@ use pyo3::{
 use ustr::Ustr;
 
 use crate::{
-    actor::{DataActor, DataActorNative, ResponseScope, registry::try_get_actor_unchecked},
+    actor::{
+        DataActor, DataActorNative, ResponseScope, data_actor::release_warmup,
+        registry::try_get_actor_unchecked,
+    },
     messages::data::{DataResponse, DataResponseEnvelope},
     msgbus::TypedHandler,
     python::logging::format_exception,
@@ -128,7 +131,7 @@ impl PyDataResponse {
     }
 }
 
-/// Builds a response handler that releases actor access before invoking Python hooks.
+/// Builds a response handler that releases actor access before invoking Python response hooks.
 #[doc(hidden)]
 pub fn response_handler<T>(
     actor_id: Ustr,
@@ -159,8 +162,14 @@ where
                 );
             }
 
-            let current = try_get_actor_unchecked::<T>(&actor_id)
-                .is_some_and(|actor| actor.core().complete_request(envelope, &scope));
+            // A released handler can clean up the request, which suppresses its completion
+            let current = try_get_actor_unchecked::<T>(&actor_id).is_some_and(|mut actor| {
+                if !actor.core().complete_request(envelope, &scope) {
+                    return false;
+                }
+                release_warmup(&mut *actor);
+                actor.core().is_response_current(&scope)
+            });
 
             if current {
                 dispatch_completion(py, instance.as_ref(), wrapper);

@@ -93,8 +93,8 @@ use nautilus_model::{
         option_chain::OptionGreeks,
     },
     enums::{
-        AggregationSource, ContingencyType, InstrumentClass, OmsType, OrderSide, PositionSide,
-        PriceType,
+        AggregationSource, ContingencyType, InstrumentClass, InstrumentCloseType, OmsType,
+        OrderSide, PositionSide, PriceType,
     },
     events::{AccountState, OrderEventAny, OrderFilled, PositionAdjusted},
     identifiers::{
@@ -492,9 +492,14 @@ impl Cache {
     /// Returns the execution client registered as the route for `venue`, else the default client.
     #[must_use]
     pub fn client_id_for_venue(&self, venue: &Venue) -> Option<&ClientId> {
-        self.client_routes
-            .get(venue)
+        self.client_route_for_venue(venue)
             .or(self.default_client_id.as_ref())
+    }
+
+    /// Returns the execution client registered as the route for `venue`, if one exists.
+    #[must_use]
+    pub fn client_route_for_venue(&self, venue: &Venue) -> Option<&ClientId> {
+        self.client_routes.get(venue)
     }
 
     /// Registers the execution client `client_id` as the route for commands on `venue`, replacing
@@ -2536,7 +2541,8 @@ impl Cache {
     /// A value of 0 purges all but the latest account state event.
     ///
     /// When `purge_from_database` is true, also requests deletion from the backing database.
-    /// Redis and PostgreSQL log the request and retain the full account history for replay.
+    /// Redis purges expired events and stores a replay checkpoint when it removes distinct events.
+    /// PostgreSQL retains the full history.
     ///
     /// Persistence failures are logged without failing the operation.
     ///
@@ -2571,26 +2577,30 @@ impl Cache {
                     count_diff,
                     account.id()
                 );
+            }
 
-                if let Some(database) = &self.database
-                    && let Some(events_before) = events_before
-                {
-                    Self::delete_purged_account_events(
-                        database.as_ref(),
-                        &account,
-                        &events_before,
-                    )?;
-                }
+            if let Some(database) = &self.database
+                && let Some(events_before) = events_before
+            {
+                Self::purge_persisted_account_events(
+                    database.as_ref(),
+                    &account,
+                    &events_before,
+                    ts_now,
+                    lookback_secs,
+                )?;
             }
         }
 
         Ok(())
     }
 
-    fn delete_purged_account_events(
+    fn purge_persisted_account_events(
         database: &dyn CacheDatabaseAdapter,
         account: &AccountAny,
         events_before: &[AccountState],
+        ts_now: UnixNanos,
+        lookback_secs: u64,
     ) -> anyhow::Result<()> {
         let retained: AHashSet<_> = account
             .events()
@@ -2598,18 +2608,16 @@ impl Cache {
             .map(|event| event.event_id)
             .collect();
 
-        for event in events_before {
-            if retained.contains(&event.event_id) {
-                continue;
-            }
-
-            handle_persistence_result(
-                format_args!("delete account event {}", event.event_id),
-                database.delete_account_event(&account.id(), &event.event_id.to_string()),
-            )?;
-        }
-
-        Ok(())
+        let removed: Vec<_> = events_before
+            .iter()
+            .map(|event| event.event_id)
+            .filter(|id| !retained.contains(id))
+            .collect();
+        let account_id = account.id();
+        handle_persistence_result(
+            format_args!("purge persisted events for account {account_id}"),
+            database.purge_account_events(&account_id, &removed, ts_now, lookback_secs),
+        )
     }
 
     /// Clears the caches index.
@@ -2915,8 +2923,13 @@ impl Cache {
             )?;
         }
 
-        self.instrument_closes.insert(close.instrument_id, close);
+        self.cache_instrument_close(close);
         Ok(())
+    }
+
+    /// Stores the latest close in memory without writing it to the backing database.
+    pub fn cache_instrument_close(&mut self, close: InstrumentClose) {
+        self.instrument_closes.insert(close.instrument_id, close);
     }
 
     /// Adds the `quote` tick to the cache.
@@ -3217,11 +3230,26 @@ impl Cache {
 
     /// Gets the yield curve for the `key`.
     pub fn yield_curve(&self, key: &str) -> Option<Box<dyn Fn(f64) -> f64>> {
-        self.yield_curves.get(key).map(|curve| {
+        self.yield_curve_ref(key).map(|curve| {
             let curve_clone = curve.clone();
             Box::new(move |expiry_in_years: f64| curve_clone.get_rate(expiry_in_years))
                 as Box<dyn Fn(f64) -> f64>
         })
+    }
+
+    pub(crate) fn yield_curve_for_instrument(
+        &self,
+        instrument_id: &InstrumentId,
+    ) -> Option<&YieldCurve> {
+        if self.yield_curves.is_empty() {
+            return None;
+        }
+
+        self.yield_curve_ref(&instrument_id.to_string())
+    }
+
+    pub(crate) fn yield_curve_ref(&self, key: &str) -> Option<&YieldCurve> {
+        self.yield_curves.get(key)
     }
 
     /// Adds the `currency` to the cache.
@@ -3237,14 +3265,7 @@ impl Cache {
         let token = nautilus_model::defi::currency::check(currency)?.is_some();
         #[cfg(feature = "defi")]
         if token {
-            if let Some(existing) = self.currencies.get(&currency.code) {
-                if !self.defi.contains_currency(&currency.code) {
-                    anyhow::bail!("Legacy currency occupies token code {}", currency.code);
-                }
-
-                nautilus_model::defi::currency::check(*existing)?;
-            }
-
+            self.check_cached_token_currency(currency.code)?;
             Currency::register(currency, false)?;
         }
 
@@ -4584,6 +4605,43 @@ impl Cache {
         }
 
         Ok(snapshot)
+    }
+
+    /// Records runtime activation on the cached trailing stop and in backends that support it.
+    ///
+    /// Activation preserves lifecycle events. Ignores other order types and logs an error if the
+    /// order is missing.
+    pub fn store_trailing_stop_activation(
+        &mut self,
+        client_order_id: ClientOrderId,
+        activation_price: Price,
+    ) {
+        let Some(mut order) = self.order_mut(&client_order_id) else {
+            log::error!("Cannot store trailing stop activation: order {client_order_id} not found");
+            return;
+        };
+
+        let init_id = order.init_id();
+        let (price, is_activated) = match &mut *order {
+            OrderAny::TrailingStopMarket(order) => {
+                (&mut order.activation_price, &mut order.is_activated)
+            }
+            OrderAny::TrailingStopLimit(order) => {
+                (&mut order.activation_price, &mut order.is_activated)
+            }
+            _ => return,
+        };
+
+        *price = Some(activation_price);
+        *is_activated = true;
+        drop(order);
+
+        if let Some(database) = &self.database
+            && let Err(e) =
+                database.store_trailing_stop_activation(client_order_id, init_id, activation_price)
+        {
+            log::error!("Failed to persist trailing stop activation for {client_order_id}: {e:#}");
+        }
     }
 
     fn reindex_order_position_after_fill_void(&mut self, client_order_id: ClientOrderId) {
@@ -7861,6 +7919,16 @@ impl Cache {
         self.instrument_closes.get(instrument_id)
     }
 
+    /// Returns the cached contract expiry close for `instrument_id`, if present.
+    #[must_use]
+    pub fn instrument_expiry_close(
+        &self,
+        instrument_id: &InstrumentId,
+    ) -> Option<&InstrumentClose> {
+        self.instrument_close(instrument_id)
+            .filter(|close| close.close_type == InstrumentCloseType::ContractExpired)
+    }
+
     /// Returns references to all instrument IDs with a cached close.
     #[must_use]
     pub fn instrument_close_ids(&self) -> Vec<&InstrumentId> {
@@ -8488,10 +8556,16 @@ impl Cache {
     /// Returns owned copies of every account in the cache.
     #[must_use]
     pub fn accounts_all_owned(&self) -> Vec<AccountAny> {
+        self.accounts_all_refs()
+            .map(|account| account.cloned())
+            .collect()
+    }
+
+    /// Iterates over the cached accounts. Drop each borrow before mutating its account.
+    pub fn accounts_all_refs(&self) -> impl Iterator<Item = AccountRef<'_>> {
         self.accounts
             .values()
-            .map(|account_cell| account_cell.borrow().clone())
-            .collect()
+            .map(|account_cell| AccountRef::new(account_cell.borrow()))
     }
 
     /// Updates the own order book with an order.

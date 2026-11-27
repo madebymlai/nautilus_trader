@@ -67,7 +67,7 @@ use nautilus_model::{
     data::{Bar, Data, QuoteTick},
     enums::{AggregationSource, BookType, PriceType},
     identifiers::{ClientId, InstrumentId, TradeId, Venue},
-    instruments::{Instrument, InstrumentAny},
+    instruments::{CryptoPerpetual, Instrument, InstrumentAny},
     types::Price,
 };
 use parking_lot::Mutex;
@@ -119,6 +119,7 @@ pub struct DeriveDataClient {
     pending_tasks: TaskGroup,
     shutdown_errors: Vec<String>,
     data_sender: EventSender<DataEvent>,
+    instrument_refresh_lock: Arc<tokio::sync::Mutex<()>>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     active_book_delta_channels: Arc<AtomicMap<InstrumentId, String>>,
     active_book_depth_channels: Arc<AtomicMap<InstrumentId, String>>,
@@ -200,6 +201,7 @@ impl DeriveDataClient {
             pending_tasks,
             shutdown_errors: Vec::new(),
             data_sender,
+            instrument_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             instruments: Arc::new(AtomicMap::new()),
             active_book_delta_channels: Arc::new(AtomicMap::new()),
             active_book_depth_channels: Arc::new(AtomicMap::new()),
@@ -420,6 +422,7 @@ impl DeriveDataClient {
         let cancellation = self.cancellation_token.clone();
         let http_client = self.http_client.clone();
         let include_expired = self.config.include_expired;
+        let instrument_refresh_lock = Arc::clone(&self.instrument_refresh_lock);
         let instruments = Arc::clone(&self.instruments);
         let sender = self.data_sender.clone();
         let subscription_lock = Arc::clone(&self.subscription_lock);
@@ -431,6 +434,12 @@ impl DeriveDataClient {
                     () = cancellation.cancelled() => break,
                     () = time::sleep(interval) => {}
                 }
+
+                let _refresh_guard = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return,
+                    guard = instrument_refresh_lock.lock() => guard,
+                };
 
                 for currency in &currencies {
                     let result = tokio::select! {
@@ -448,6 +457,7 @@ impl DeriveDataClient {
                                 &sender,
                                 &cancellation,
                                 &subscription_lock,
+                                false,
                             );
                         }
                         Err(e) => {
@@ -793,6 +803,7 @@ impl DeriveDataClient {
             &self.data_sender,
             &self.cancellation_token,
             &self.subscription_lock,
+            true,
         );
     }
 
@@ -815,21 +826,28 @@ impl DeriveDataClient {
         instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
         instrument_id: InstrumentId,
         include_expired: bool,
+        instrument_refresh_lock: &tokio::sync::Mutex<()>,
+        publication: (&EventSender<DataEvent>, &CancellationToken, &Mutex<()>),
     ) -> anyhow::Result<()> {
         let currency = currency_from_instrument_id(&instrument_id)?;
+        let _refresh_guard = instrument_refresh_lock.lock().await;
         let definitions = fetch_instrument_definitions(&http_client, currency, include_expired)
             .await
             .with_context(|| format!("failed to lazy-load Derive instruments for {currency}"))?;
         let loaded = parse_instrument_definitions(definitions);
-        instruments.rcu(|cache| {
-            for instrument in &loaded {
-                cache.insert(instrument.id(), instrument.clone());
-            }
-        });
-
         let found = loaded
             .iter()
             .any(|instrument| instrument.id() == instrument_id);
+
+        let (sender, cancellation, subscription_lock) = publication;
+        cache_instruments(
+            loaded,
+            &instruments,
+            sender,
+            cancellation,
+            subscription_lock,
+            false,
+        );
 
         if !found {
             anyhow::bail!(InstrumentLookupError::not_found(instrument_id));
@@ -899,7 +917,11 @@ impl DeriveDataClient {
         let ws = self.ws_handle();
         let http_client = self.http_client.clone();
         let include_expired = self.config.include_expired;
+        let instrument_refresh_lock = Arc::clone(&self.instrument_refresh_lock);
         let instruments = Arc::clone(&self.instruments);
+        let sender = self.data_sender.clone();
+        let cancellation = self.cancellation_token.clone();
+        let subscription_lock = Arc::clone(&self.subscription_lock);
 
         self.spawn_task("subscribe_ticker_feed", async move {
             if needs_load
@@ -908,6 +930,8 @@ impl DeriveDataClient {
                     instruments,
                     instrument_id,
                     include_expired,
+                    &instrument_refresh_lock,
+                    (&sender, &cancellation, &subscription_lock),
                 )
                 .await
             {
@@ -922,28 +946,28 @@ impl DeriveDataClient {
         Ok(())
     }
 
-    fn unsubscribe_channel_owner(&self, owner: ChannelOwner) -> anyhow::Result<()> {
+    fn unsubscribe_channel_owner(&self, owner: ChannelOwner) {
         let lifecycle = self.subscription_lifecycle();
 
         let Some(removed) = lifecycle.remove(owner) else {
-            return Ok(());
+            return;
         };
 
         if !removed.channel_empty {
-            return Ok(());
+            return;
         }
 
         let Some(channel) = removed.channel else {
-            return Ok(());
+            return;
         };
 
-        let request = ChannelRequest::from_channel(&channel)?;
-        let ws = self.ws_handle();
-        self.spawn_task("unsubscribe_channel", async move {
-            run_channel_unsubscribe(lifecycle, request, ws).await
-        });
-
-        Ok(())
+        if lifecycle.registry.queue_unsubscribe(channel) {
+            let ws = self.ws_handle();
+            let cancellation = self.cancellation_token.clone();
+            self.spawn_task("unsubscribe_channels", async move {
+                drain_unsubscribes(lifecycle, ws, cancellation).await
+            });
+        }
     }
 }
 
@@ -1042,6 +1066,7 @@ impl DataClient for DeriveDataClient {
             });
 
         if !self.config.currencies.is_empty() {
+            let _refresh_guard = self.instrument_refresh_lock.lock().await;
             self.provider
                 .load_all(None)
                 .await
@@ -1113,7 +1138,11 @@ impl DataClient for DeriveDataClient {
             let ws = self.ws_handle();
             let http_client = self.http_client.clone();
             let include_expired = self.config.include_expired;
+            let instrument_refresh_lock = Arc::clone(&self.instrument_refresh_lock);
             let instruments = Arc::clone(&self.instruments);
+            let sender = self.data_sender.clone();
+            let cancellation = self.cancellation_token.clone();
+            let subscription_lock = Arc::clone(&self.subscription_lock);
 
             self.spawn_task("subscribe_book_deltas", async move {
                 if needs_load
@@ -1122,6 +1151,8 @@ impl DataClient for DeriveDataClient {
                         instruments,
                         instrument_id,
                         include_expired,
+                        &instrument_refresh_lock,
+                        (&sender, &cancellation, &subscription_lock),
                     )
                     .await
                 {
@@ -1164,7 +1195,11 @@ impl DataClient for DeriveDataClient {
             let ws = self.ws_handle();
             let http_client = self.http_client.clone();
             let include_expired = self.config.include_expired;
+            let instrument_refresh_lock = Arc::clone(&self.instrument_refresh_lock);
             let instruments = Arc::clone(&self.instruments);
+            let sender = self.data_sender.clone();
+            let cancellation = self.cancellation_token.clone();
+            let subscription_lock = Arc::clone(&self.subscription_lock);
 
             self.spawn_task("subscribe_book_depth", async move {
                 if needs_load
@@ -1173,6 +1208,8 @@ impl DataClient for DeriveDataClient {
                         instruments,
                         instrument_id,
                         include_expired,
+                        &instrument_refresh_lock,
+                        (&sender, &cancellation, &subscription_lock),
                     )
                     .await
                 {
@@ -1212,7 +1249,11 @@ impl DataClient for DeriveDataClient {
             let ws = self.ws_handle();
             let http_client = self.http_client.clone();
             let include_expired = self.config.include_expired;
+            let instrument_refresh_lock = Arc::clone(&self.instrument_refresh_lock);
             let instruments = Arc::clone(&self.instruments);
+            let sender = self.data_sender.clone();
+            let cancellation = self.cancellation_token.clone();
+            let subscription_lock = Arc::clone(&self.subscription_lock);
 
             self.spawn_task("subscribe_trades", async move {
                 if needs_load
@@ -1221,6 +1262,8 @@ impl DataClient for DeriveDataClient {
                         Arc::clone(&instruments),
                         instrument_id,
                         include_expired,
+                        &instrument_refresh_lock,
+                        (&sender, &cancellation, &subscription_lock),
                     )
                     .await
                 {
@@ -1313,13 +1356,15 @@ impl DataClient for DeriveDataClient {
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
         execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
-            self.unsubscribe_channel_owner(ChannelOwner::BookDeltas(instrument_id))
+            self.unsubscribe_channel_owner(ChannelOwner::BookDeltas(instrument_id));
+            Ok(())
         })
     }
 
     fn unsubscribe_book_depth(&mut self, cmd: &UnsubscribeBookDepth) -> anyhow::Result<()> {
         execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
-            self.unsubscribe_channel_owner(ChannelOwner::BookDepth(instrument_id))
+            self.unsubscribe_channel_owner(ChannelOwner::BookDepth(instrument_id));
+            Ok(())
         })
     }
 
@@ -1328,13 +1373,16 @@ impl DataClient for DeriveDataClient {
             self.unsubscribe_channel_owner(ChannelOwner::Ticker {
                 instrument_id,
                 feed: TickerFeed::Quote,
-            })
+            });
+
+            Ok(())
         })
     }
 
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
         execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
-            self.unsubscribe_channel_owner(ChannelOwner::Trades(instrument_id))
+            self.unsubscribe_channel_owner(ChannelOwner::Trades(instrument_id));
+            Ok(())
         })
     }
 
@@ -1343,7 +1391,9 @@ impl DataClient for DeriveDataClient {
             self.unsubscribe_channel_owner(ChannelOwner::Ticker {
                 instrument_id,
                 feed: TickerFeed::Mark,
-            })
+            });
+
+            Ok(())
         })
     }
 
@@ -1352,7 +1402,9 @@ impl DataClient for DeriveDataClient {
             self.unsubscribe_channel_owner(ChannelOwner::Ticker {
                 instrument_id,
                 feed: TickerFeed::Index,
-            })
+            });
+
+            Ok(())
         })
     }
 
@@ -1361,7 +1413,9 @@ impl DataClient for DeriveDataClient {
             self.unsubscribe_channel_owner(ChannelOwner::Ticker {
                 instrument_id,
                 feed: TickerFeed::Funding,
-            })
+            });
+
+            Ok(())
         })
     }
 
@@ -1370,7 +1424,9 @@ impl DataClient for DeriveDataClient {
             self.unsubscribe_channel_owner(ChannelOwner::Ticker {
                 instrument_id,
                 feed: TickerFeed::Greeks,
-            })
+            });
+
+            Ok(())
         })
     }
 
@@ -1939,6 +1995,9 @@ impl DataClient for DeriveDataClient {
         let http_client = self.http_client.clone();
         let include_expired = self.config.include_expired;
         let instruments_cache = Arc::clone(&self.instruments);
+        let instrument_refresh_lock = Arc::clone(&self.instrument_refresh_lock);
+        let subscription_lock = Arc::clone(&self.subscription_lock);
+        let cancellation = self.cancellation_token.clone();
         let sender = self.data_sender.clone();
         let clock = self.clock;
         let venue = self.venue().unwrap_or(*DERIVE_VENUE);
@@ -1946,27 +2005,39 @@ impl DataClient for DeriveDataClient {
         let request_id = request.request_id;
         let start_nanos = datetime_to_unix_nanos(request.start);
         let end_nanos = datetime_to_unix_nanos(request.end);
+        let publish = request.start.is_none() && request.end.is_none();
         let params = request.params;
 
         self.spawn_task("request_instruments", async move {
+            let _refresh_guard = instrument_refresh_lock.lock().await;
+
             let mut all_instruments = Vec::new();
 
             for currency in currencies {
                 match fetch_instrument_definitions(&http_client, &currency, include_expired).await {
                     Ok(definitions) => {
-                        let instruments = parse_instrument_definitions(definitions);
-                        instruments_cache.rcu(|cache| {
-                            for instrument in &instruments {
-                                cache.insert(instrument.id(), instrument.clone());
-                            }
-                        });
-
-                        all_instruments.extend(instruments);
+                        all_instruments.extend(parse_instrument_definitions(definitions));
                     }
                     Err(e) => {
                         log::error!("Failed to fetch Derive instruments for {currency}: {e:?}");
                     }
                 }
+            }
+
+            let _guard = subscription_lock.lock();
+
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+
+            if publish {
+                instruments_cache.rcu(|cache| {
+                    for instrument in &all_instruments {
+                        cache.insert(instrument.id(), instrument.clone());
+                    }
+                });
+
+                publish_active_instruments(&all_instruments, &sender, clock.get_time_ns());
             }
 
             let response = DataResponse::Instruments(InstrumentsResponse::new(
@@ -1997,15 +2068,21 @@ impl DataClient for DeriveDataClient {
 
         let http_client = self.http_client.clone();
         let instruments_cache = Arc::clone(&self.instruments);
+        let instrument_refresh_lock = Arc::clone(&self.instrument_refresh_lock);
+        let subscription_lock = Arc::clone(&self.subscription_lock);
+        let cancellation = self.cancellation_token.clone();
         let sender = self.data_sender.clone();
         let clock = self.clock;
         let client_id = request.client_id.unwrap_or(self.client_id);
         let request_id = request.request_id;
         let start_nanos = datetime_to_unix_nanos(request.start);
         let end_nanos = datetime_to_unix_nanos(request.end);
+        let publish = request.start.is_none() && request.end.is_none();
         let params = request.params;
 
         self.spawn_task("request_instrument", async move {
+            let _refresh_guard = instrument_refresh_lock.lock().await;
+
             let definition = match http_client.get_instrument(&venue_symbol).await {
                 Ok(definition) => definition,
                 Err(e) => {
@@ -2031,7 +2108,16 @@ impl DataClient for DeriveDataClient {
                 }
             };
 
-            cache_instrument(&instruments_cache, &instrument);
+            let _guard = subscription_lock.lock();
+
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+
+            if publish {
+                cache_instrument(&instruments_cache, &instrument);
+                publish_active_instruments(std::slice::from_ref(&instrument), &sender, ts_init);
+            }
 
             let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
                 request_id,
@@ -2092,6 +2178,7 @@ struct ChannelSubscriptionState {
 struct ChannelSubscriptionRegistry {
     state: Mutex<ChannelSubscriptionState>,
     transitions: DashMap<String, Weak<tokio::sync::Mutex<()>>>,
+    pending_unsubscribes: Mutex<Option<Vec<String>>>,
 }
 
 const TRANSITION_GC_THRESHOLD: usize = 256;
@@ -2212,32 +2299,41 @@ async fn run_channel_subscribe(
         .dispatch
         .book_sync
         .subscription_written(&channel, lifecycle.snapshot_timeout);
-    if !lifecycle.has_owners(&channel)
-        && let Err(e) = request.unsubscribe(&ws).await
-    {
-        log::error!("Failed to clean up stale Derive channel `{channel}`: {e}");
-        ws.forget_subscription(&channel);
-    }
 
     Ok(())
 }
 
-async fn run_channel_unsubscribe(
+async fn drain_unsubscribes(
     lifecycle: SubscriptionLifecycle,
-    request: ChannelRequest,
     ws: DeriveWebSocketSubscriptionHandle,
+    cancellation: CancellationToken,
 ) -> anyhow::Result<()> {
-    let channel = request.channel().to_string();
-    let transition = lifecycle.registry.transition(&channel);
-    let _guard = transition.lock().await;
+    while let Some(mut pending) = lifecycle.registry.next_unsubscribes() {
+        pending.sort_unstable();
+        pending.dedup();
 
-    if lifecycle.has_owners(&channel) || !ws.has_subscription(&channel) {
-        return Ok(());
-    }
+        let mut guards = Vec::with_capacity(pending.len());
+        let mut channels = Vec::with_capacity(pending.len());
+        for channel in pending {
+            let guard = lifecycle.registry.transition(&channel).lock_owned().await;
+            guards.push(guard);
+            channels.push(channel);
+        }
 
-    if let Err(e) = request.unsubscribe(&ws).await {
-        log::error!("Failed to unsubscribe from Derive channel `{channel}`: {e}");
-        ws.forget_subscription(&channel);
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => break,
+            result = ws.unsubscribe_ownerless_channels(&mut channels, |channel| lifecycle.has_owners(channel)) => {
+                if let Err(e) = result
+                    && !cancellation.is_cancelled()
+                {
+                    log::error!("Failed to unsubscribe from Derive channels {channels:?}: {e}");
+                    for channel in channels {
+                        ws.forget_subscription(&channel);
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -2395,6 +2491,31 @@ impl SubscriptionDispatchState {
 }
 
 impl ChannelSubscriptionRegistry {
+    fn queue_unsubscribe(&self, channel: String) -> bool {
+        let mut pending = self.pending_unsubscribes.lock();
+        match pending.as_mut() {
+            Some(channels) => {
+                channels.push(channel);
+                false
+            }
+            None => {
+                *pending = Some(vec![channel]);
+                true
+            }
+        }
+    }
+
+    fn next_unsubscribes(&self) -> Option<Vec<String>> {
+        let mut pending = self.pending_unsubscribes.lock();
+        let channels = pending.as_mut()?;
+        if channels.is_empty() {
+            *pending = None;
+            return None;
+        }
+
+        Some(std::mem::take(channels))
+    }
+
     fn transition(&self, channel: &str) -> Arc<tokio::sync::Mutex<()>> {
         if self.transitions.len() >= TRANSITION_GC_THRESHOLD {
             self.transitions
@@ -2412,6 +2533,7 @@ impl ChannelSubscriptionRegistry {
     }
 
     fn clear(&self) {
+        *self.pending_unsubscribes.lock() = None;
         let mut state = self.state.lock();
         let next_generation = state.next_generation;
 
@@ -2672,12 +2794,27 @@ impl DeriveDataClient {
     }
 }
 
+fn publish_active_instruments(
+    instruments: &[InstrumentAny],
+    sender: &EventSender<DataEvent>,
+    now: UnixNanos,
+) {
+    for instrument in instruments {
+        if instrument.expiration_ns().is_none_or(|expiry| expiry > now)
+            && let Err(e) = sender.send(DataEvent::Data(instrument.clone().into()))
+        {
+            log::warn!("Failed to send Derive instrument: {e}");
+        }
+    }
+}
+
 fn cache_instruments(
     mut loaded: Vec<InstrumentAny>,
     instruments: &AtomicMap<InstrumentId, InstrumentAny>,
     sender: &EventSender<DataEvent>,
     cancellation: &CancellationToken,
     subscription_lock: &Mutex<()>,
+    publish_unchanged: bool,
 ) {
     loaded.sort_by_key(|instrument| instrument.id());
     let _guard = subscription_lock.lock();
@@ -2686,6 +2823,7 @@ fn cache_instruments(
         return;
     }
 
+    let previous = instruments.load();
     instruments.rcu(|cache| {
         for instrument in &loaded {
             cache.insert(instrument.id(), instrument.clone());
@@ -2693,10 +2831,47 @@ fn cache_instruments(
     });
 
     for instrument in loaded {
-        if let Err(e) = sender.send(DataEvent::Data(instrument.into())) {
+        if (publish_unchanged
+            || previous
+                .get(&instrument.id())
+                .is_none_or(|cached| !same_instrument_definition(cached, &instrument)))
+            && let Err(e) = sender.send(DataEvent::Data(instrument.into()))
+        {
             log::warn!("Failed to send Derive instrument: {e}");
         }
     }
+}
+
+fn same_instrument_definition(previous: &InstrumentAny, current: &InstrumentAny) -> bool {
+    let (InstrumentAny::CryptoPerpetual(previous), InstrumentAny::CryptoPerpetual(current)) =
+        (previous, current)
+    else {
+        return previous.same_definition(current);
+    };
+
+    let normalize = |instrument: &CryptoPerpetual| {
+        let mut instrument = instrument.clone();
+        if let Some(info) = instrument.info.take() {
+            let entries = info.borrowed_entries().map(|(key, value)| {
+                let mut value = value.clone();
+
+                if key == "perp_details"
+                    && let Some(details) = value.as_object_mut()
+                {
+                    details.remove("funding_rate");
+                    details.remove("aggregate_funding");
+                }
+
+                (key.clone(), value)
+            });
+
+            instrument.info = Some(Params::new(entries.collect()));
+        }
+
+        InstrumentAny::CryptoPerpetual(instrument)
+    };
+
+    normalize(previous).same_definition(&normalize(current))
 }
 
 fn cache_instrument(
@@ -2921,6 +3096,43 @@ mod tests {
         serde_json::from_str(&content).expect("invalid json")
     }
 
+    #[tokio::test]
+    async fn test_instrument_refresh_caches_new_timestamp_without_republishing() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_data_event_sender(sender);
+        let client =
+            DeriveDataClient::new(*DERIVE_CLIENT_ID, DeriveDataClientConfig::default()).unwrap();
+        let original = perp_instrument();
+        let id = original.id();
+        client.instruments.insert(id, original);
+        let mut definition = load_json("perps/instrument_eth.json");
+        definition["perp_details"]["funding_rate"] = json!("0.01");
+        definition["perp_details"]["aggregate_funding"] = json!("0.02");
+        let refreshed = parse_derive_instrument_any(
+            &serde_json::from_value(definition).unwrap(),
+            UnixNanos::from(2),
+        )
+        .unwrap()
+        .unwrap();
+
+        cache_instruments(
+            vec![refreshed],
+            &client.instruments,
+            &client.data_sender,
+            &client.cancellation_token,
+            &client.subscription_lock,
+            false,
+        );
+
+        let cached = client.instruments.get_cloned(&id).unwrap();
+        assert_eq!(cached.ts_init(), UnixNanos::from(2));
+        assert_eq!(
+            cached.info().unwrap().get("perp_details").unwrap()["aggregate_funding"],
+            json!("0.02"),
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[rstest]
     #[case::stop("stop")]
     #[case::reset("reset")]
@@ -2954,6 +3166,7 @@ mod tests {
             &client.data_sender,
             &cancellation,
             &client.subscription_lock,
+            false,
         );
 
         let expected = (shutdown != "reset").then_some(original);

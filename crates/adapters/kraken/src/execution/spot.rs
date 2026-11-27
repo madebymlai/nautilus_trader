@@ -35,6 +35,7 @@ use nautilus_common::{
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
         ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
     },
+    msgbus::{InstrumentSubscription, TypedHandler, switchboard::get_instruments_pattern},
 };
 use nautilus_core::{
     AtomicMap, DurationNanos, Params, UUID4, UnixNanos,
@@ -111,6 +112,7 @@ pub struct KrakenSpotExecutionClient {
     emitter: ExecutionEventEmitter,
     http: KrakenSpotHttpClient,
     ws: KrakenSpotWebSocketClient,
+    instrument_subscription: Option<InstrumentSubscription>,
     cancellation_token: CancellationToken,
     session_tasks: TaskGroup,
     pending_tasks: TaskGroup,
@@ -204,12 +206,10 @@ impl KrakenSpotExecutionClient {
         // Connect() swaps in a live cmd_tx; capture the shared handle so the
         // dispatcher reads the current sender, not the dropped placeholder.
         let cmd_tx_handle = ws.handler_command_handle();
-        // Placeholder: each connect installs the sender for that session's channel
-        let (order_event_tx, _) = tokio::sync::mpsc::unbounded_channel();
 
         let order_request_state = Arc::new(OrderRequestState::new(
             cmd_tx_handle,
-            order_event_tx,
+            emitter.clone(),
             Arc::clone(&ws_dispatch_state),
             ws.req_id_counter(),
             Duration::from_secs(config.ws_request_timeout_secs),
@@ -227,6 +227,7 @@ impl KrakenSpotExecutionClient {
             emitter,
             http,
             ws,
+            instrument_subscription: None,
             cancellation_token,
             session_tasks,
             pending_tasks,
@@ -579,9 +580,6 @@ impl KrakenSpotExecutionClient {
         let clock = self.clock;
         let cancellation_token = self.cancellation_token.clone();
 
-        let (order_event_tx, mut order_event_rx) = tokio::sync::mpsc::unbounded_channel();
-        self.order_request_state.reset_event_sender(order_event_tx);
-
         let future = async move {
             tokio::pin!(stream);
 
@@ -618,36 +616,7 @@ impl KrakenSpotExecutionClient {
 
         self.session_tasks
             .spawn(future)
-            .context("failed to register Kraken Spot execution stream task")?;
-
-        let emitter = self.emitter.clone();
-        let cancellation_token = self.cancellation_token.clone();
-
-        let future = async move {
-            loop {
-                tokio::select! {
-                    () = cancellation_token.cancelled() => {
-                        log::debug!("Spot execution order-event forwarder cancelled");
-                        break;
-                    }
-                    event = order_event_rx.recv() => {
-                        match event {
-                            Some(event) => emitter.send_order_event(event),
-                            None => {
-                                log::debug!("Spot execution order-event channel closed");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        self.session_tasks
-            .spawn(future)
-            .context("failed to register Kraken Spot order event task")?;
-
-        Ok(())
+            .context("failed to register Kraken Spot execution stream task")
     }
 
     fn modify_single_order(&self, cmd: &ModifyOrder) {
@@ -1118,6 +1087,44 @@ fn build_batch_order(
     })
 }
 
+impl KrakenSpotExecutionClient {
+    fn subscribe_instruments(&mut self) {
+        if self.instrument_subscription.is_some() {
+            return;
+        }
+
+        let http = self.http.clone();
+        let instruments = Arc::clone(&self.instruments);
+        self.instrument_subscription = Some(InstrumentSubscription::new(
+            get_instruments_pattern(self.venue()),
+            TypedHandler::from(move |instrument: &InstrumentAny| {
+                Self::apply_instrument(&http, &instruments, instrument.clone());
+            }),
+        ));
+    }
+
+    fn apply_instrument(
+        http: &KrakenSpotHttpClient,
+        instruments: &AtomicMap<InstrumentId, InstrumentAny>,
+        instrument: InstrumentAny,
+    ) {
+        let id = instrument.id();
+        if id.venue == *KRAKEN_VENUE
+            && matches!(
+                instrument,
+                InstrumentAny::CurrencyPair(_) | InstrumentAny::TokenizedAsset(_)
+            )
+            && instruments
+                .load()
+                .get(&id)
+                .is_none_or(|previous| previous.ts_init() <= instrument.ts_init())
+        {
+            http.cache_instrument(instrument.clone());
+            instruments.insert(id, instrument);
+        }
+    }
+}
+
 #[async_trait(?Send)]
 impl ExecutionClient for KrakenSpotExecutionClient {
     fn is_connected(&self) -> bool {
@@ -1134,6 +1141,10 @@ impl ExecutionClient for KrakenSpotExecutionClient {
 
     fn venue(&self) -> Venue {
         *KRAKEN_VENUE
+    }
+
+    fn on_instrument(&mut self, instrument: InstrumentAny) {
+        Self::apply_instrument(&self.http, &self.instruments, instrument);
     }
 
     fn oms_type(&self) -> OmsType {
@@ -1169,6 +1180,8 @@ impl ExecutionClient for KrakenSpotExecutionClient {
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_instruments();
+
         if self.core.is_started() {
             return Ok(());
         }
@@ -1186,6 +1199,8 @@ impl ExecutionClient for KrakenSpotExecutionClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        self.instrument_subscription.take();
+
         if self.core.is_stopped() {
             return Ok(());
         }
@@ -1201,6 +1216,8 @@ impl ExecutionClient for KrakenSpotExecutionClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
+        self.subscribe_instruments();
+
         if self.core.is_connected() && self.session_tasks.is_open() && self.pending_tasks.is_open()
         {
             return Ok(());
@@ -1210,13 +1227,25 @@ impl ExecutionClient for KrakenSpotExecutionClient {
         self.prepare_task_groups().await?;
 
         if !self.core.instruments_initialized() {
-            let instruments = self
+            let snapshot = self
                 .http
-                .request_instruments(None)
+                .fetch_instruments(None)
                 .await
                 .context("Failed to load Kraken spot instruments")?;
-            log::debug!("Loaded {} Spot instruments", instruments.len());
-            self.http.cache_instruments(&instruments);
+            let current = self.instruments.load();
+            let accepted: Vec<_> = snapshot
+                .instruments
+                .iter()
+                .filter(|instrument| {
+                    current
+                        .get(&instrument.id())
+                        .is_none_or(|cached| cached.ts_init() <= instrument.ts_init())
+                })
+                .cloned()
+                .collect();
+
+            log::debug!("Loaded {} Spot instruments", accepted.len());
+            self.http.cache_instrument_snapshot(&snapshot, &accepted);
             self.core.set_instruments_initialized();
         }
 
@@ -1267,8 +1296,11 @@ impl ExecutionClient for KrakenSpotExecutionClient {
                 }
             });
 
+            // This subscription restates no open order, so a shape kept from an earlier session
+            // misses what changed since
+            self.ws_dispatch_state.forget_spot_order_shapes();
             self.ws
-                .subscribe_executions(false, false)
+                .subscribe_executions_for_reconciliation()
                 .await
                 .context("Failed to subscribe to executions")?;
 

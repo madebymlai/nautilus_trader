@@ -507,8 +507,8 @@ pub struct LiveExecutionEngineConfig {
     pub purge_account_events_interval_mins: Option<u32>,
     /// The time buffer (minutes) before account events can be purged.
     pub purge_account_events_lookback_mins: Option<u32>,
-    /// If purging also deletes orders and positions from the backing database.
-    /// Redis and PostgreSQL retain persisted account events for replay.
+    /// If purging also deletes persisted closed orders, closed positions, and Redis account events.
+    /// PostgreSQL retains the full account event history.
     #[builder(default)]
     pub purge_from_database: bool,
     /// The interval (seconds) between audits that remove own-book orders the cache no longer
@@ -799,9 +799,6 @@ pub struct LiveNodeConfig {
     /// Retained submissions still unresolved at this boundary cause shutdown to return an error.
     #[builder(default = Duration::from_secs(10))]
     pub delay_post_stop: Duration,
-    /// The timeout to await pending tasks cancellation during shutdown.
-    #[builder(default = Duration::from_secs(5))]
-    pub timeout_shutdown: Duration,
     /// The cache configuration.
     pub cache: Option<CacheConfig>,
     /// The message bus configuration.
@@ -1166,10 +1163,6 @@ impl NautilusKernelConfig for LiveNodeConfig {
 
     fn delay_post_stop(&self) -> Duration {
         self.delay_post_stop
-    }
-
-    fn timeout_shutdown(&self) -> Duration {
-        self.timeout_shutdown
     }
 
     fn cache(&self) -> Option<CacheConfig> {

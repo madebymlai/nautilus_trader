@@ -88,6 +88,8 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     fmt::Debug,
+    future::Future,
+    pin::Pin,
     rc::{Rc, Weak},
     time::Duration,
 };
@@ -1126,7 +1128,35 @@ impl LiveNode {
             anyhow::bail!("Runner already consumed - run() called twice");
         }
 
-        self.prepare_cache().await?;
+        // Replay returns to the caller without running a signal-handling event loop
+        let owns_signals = mode.owns_signals() && !self.kernel.is_event_store_replay_configured();
+        let stop_signal = wait_for_stop_signal(owns_signals, self.handle.clone());
+        self.run_loop(stop_signal, owns_signals).await
+    }
+
+    async fn run_loop(
+        &mut self,
+        stop_signal: impl Future<Output = ()>,
+        owns_signals: bool,
+    ) -> anyhow::Result<()> {
+        tokio::pin!(stop_signal);
+
+        let cache_result = complete_before_signal(stop_signal.as_mut(), async {
+            let result = self.prepare_cache().await;
+
+            if owns_signals {
+                // Give an already-queued signal a chance to wake the node after synchronous cache work
+                dst::task::yield_now().await;
+            }
+
+            result
+        })
+        .await;
+
+        match cache_result {
+            Some(result) => result?,
+            None => return self.abort_before_run_startup().await,
+        }
 
         let Some(runner) = self.runner.take() else {
             anyhow::bail!("Runner already consumed - run() called twice");
@@ -1203,16 +1233,25 @@ impl LiveNode {
         // Startup phase 1: Connect data clients and drain instrument events into cache.
         // This ensures the cache is populated before execution clients connect.
         let mut pending_external = VecDeque::new();
-        let data_connect_result = drive_with_event_buffering(
-            drive_with_external_ingress(
-                self.connect_data_phase(),
-                &mut external_msgbus_rx,
-                &mut pending_external,
+
+        let Some(data_connect_result) = complete_before_signal(
+            stop_signal.as_mut(),
+            drive_with_event_buffering(
+                drive_with_external_ingress(
+                    self.connect_data_phase(),
+                    &mut external_msgbus_rx,
+                    &mut pending_external,
+                ),
+                &mut pending,
+                &mut receivers,
             ),
-            &mut pending,
-            &mut receivers,
         )
-        .await;
+        .await
+        else {
+            return self
+                .abort_interrupted_startup(&mut pending, &mut receivers, external_msgbus_rx)
+                .await;
+        };
 
         self.finish_external_ingress_connection(external_msgbus_rx.as_ref());
 
@@ -1241,12 +1280,20 @@ impl LiveNode {
         );
 
         // Startup phase 2: Connect execution clients (instruments now in cache)
-        let engine_connection_result = drive_with_event_buffering(
-            self.connect_exec_phase(connection_deadline),
-            &mut pending,
-            &mut receivers,
+        let Some(engine_connection_result) = complete_before_signal(
+            stop_signal.as_mut(),
+            drive_with_event_buffering(
+                self.connect_exec_phase(connection_deadline),
+                &mut pending,
+                &mut receivers,
+            ),
         )
-        .await;
+        .await
+        else {
+            return self
+                .abort_interrupted_startup(&mut pending, &mut receivers, external_msgbus_rx)
+                .await;
+        };
 
         // Flush channel receivers and drain all remaining pending events
         flush_all_pending(&mut pending, &mut receivers);
@@ -1294,7 +1341,16 @@ impl LiveNode {
         debug_assert_eq!(engine_connection_status, EngineConnectionStatus::Connected);
 
         // Run reconciliation now that instruments are in cache and start trader
-        if let Err(e) = self.perform_startup_reconciliation().await {
+        let Some(reconciliation_result) =
+            complete_before_signal(stop_signal.as_mut(), self.perform_startup_reconciliation())
+                .await
+        else {
+            return self
+                .abort_interrupted_startup(&mut pending, &mut receivers, external_msgbus_rx)
+                .await;
+        };
+
+        if let Err(e) = reconciliation_result {
             let result = self.abort_startup("Startup reconciliation failed").await;
             Self::drain_channels(&mut receivers);
             log::info!("Event loop stopped");
@@ -1309,10 +1365,7 @@ impl LiveNode {
         }
 
         if let Some(reason) = self.startup_abort_reason() {
-            let result = self.abort_startup(reason).await;
-            Self::drain_channels(&mut receivers);
-            log::info!("Event loop stopped");
-            return result;
+            return self.abort_run_startup(reason, &mut receivers).await;
         }
 
         if let Err(e) = self.kernel.start_trader() {
@@ -1470,28 +1523,6 @@ impl LiveNode {
         let mut targeted_order_report_task: Option<TargetedOrderReportTask> = None;
         let mut position_report_task: Option<PositionReportTask> = None;
 
-        // A hosted node never installs signal handlers, so these futures stay pending and their
-        // listeners are never registered. Both arms resolve to the same type as the real listeners.
-        let owns_signals = mode.owns_signals();
-        let ctrl_c = async move {
-            if owns_signals {
-                dst::signal::ctrl_c().await
-            } else {
-                std::future::pending::<std::io::Result<()>>().await
-            }
-        };
-
-        let terminate = async move {
-            if owns_signals {
-                dst::signal::terminate().await
-            } else {
-                std::future::pending::<std::io::Result<()>>().await
-            }
-        };
-
-        tokio::pin!(ctrl_c);
-        tokio::pin!(terminate);
-
         let metrics = self.handle.metrics.clone();
         let metrics_start = dst::time::Instant::now();
         metrics.reset();
@@ -1530,19 +1561,7 @@ impl LiveNode {
             tokio::select! {
                 biased;
 
-                // Signal branches first so they are always checked
-                result = &mut ctrl_c, if is_running => {
-                    match result {
-                        Ok(()) => log::info!("Received SIGINT, shutting down"),
-                        Err(e) => log::error!("Failed to listen for SIGINT: {e}"),
-                    }
-                    self.initiate_shutdown();
-                }
-                result = &mut terminate, if is_running => {
-                    match result {
-                        Ok(()) => log::info!("Received SIGTERM, shutting down"),
-                        Err(e) => log::error!("Failed to listen for SIGTERM: {e}"),
-                    }
+                () = &mut stop_signal, if is_running => {
                     self.initiate_shutdown();
                 }
                 _ = stop_check_timer.tick(), if is_running => {
@@ -1610,7 +1629,6 @@ impl LiveNode {
                             }
                         }
                         ReportTaskOutcome::TimedOut => {
-                            self.cleanup_cancelled_report_tasks(&[]);
                             log::warn!(
                                 "Open-order report collection expired after {:?}",
                                 self.config.timeout_reconciliation,
@@ -1645,9 +1663,7 @@ impl LiveNode {
 
                     match result {
                         ReportTaskOutcome::Completed(PositionReportTaskResult::Positions(result)) => {
-                            if is_shutting_down {
-                                self.cleanup_cancelled_report_tasks(&[]);
-                            } else {
+                            if !is_shutting_down {
                                 let result = result.finish();
                                 position_report_task = self.handle_position_report_result(result);
                             }
@@ -1660,7 +1676,6 @@ impl LiveNode {
                             });
                         }
                         ReportTaskOutcome::TimedOut => {
-                            self.cleanup_cancelled_report_tasks(&[]);
                             log::warn!(
                                 "Position report collection expired after {:?}",
                                 self.config.timeout_reconciliation,
@@ -2058,8 +2073,10 @@ impl LiveNode {
         &mut self,
         receiver: Option<&tokio::sync::mpsc::Receiver<BusMessage>>,
     ) {
-        if receiver.is_none() {
-            self.close_external_ingress();
+        if receiver.is_none()
+            && let Some(mut ingress) = self.external_msgbus.take_if(|ingress| !ingress.is_closed())
+        {
+            ingress.close();
         }
     }
 
@@ -2302,6 +2319,60 @@ impl LiveNode {
                 }
             }
         }
+    }
+
+    async fn abort_before_run_startup(&mut self) -> anyhow::Result<()> {
+        if let Some(mut ingress) = self.external_msgbus.take() {
+            // Release any sender blocked on the untaken receiver before closing ingress
+            drop(ingress.take_receiver());
+            ingress.close();
+        }
+
+        if matches!(self.state(), NodeState::Starting | NodeState::ShuttingDown) {
+            let result = self
+                .abort_startup("Stop signal received during startup")
+                .await;
+            self.drain_runner_pending();
+            return result;
+        }
+
+        self.handle.set_stopped();
+        Ok(())
+    }
+
+    async fn abort_interrupted_startup(
+        &mut self,
+        pending: &mut PendingEvents,
+        receivers: &mut RunnerReceivers<'_>,
+        external_msgbus_rx: Option<tokio::sync::mpsc::Receiver<BusMessage>>,
+    ) -> anyhow::Result<()> {
+        self.handle.set_shutting_down();
+        drop(external_msgbus_rx);
+
+        // Keep shared egress available while buffered events are dispatched
+        buffer_pending(pending, receivers);
+        pending.data_cmds.clear();
+        pending.exec_cmds.clear();
+        pending.drain();
+
+        // A closed publisher can leave the ingress worker running
+        if let Some(mut ingress) = self.external_msgbus.take() {
+            ingress.close();
+        }
+
+        self.abort_run_startup("Stop signal received during startup", receivers)
+            .await
+    }
+
+    async fn abort_run_startup(
+        &mut self,
+        reason: &str,
+        receivers: &mut RunnerReceivers<'_>,
+    ) -> anyhow::Result<()> {
+        let result = self.abort_startup(reason).await;
+        Self::drain_channels(receivers);
+        log::info!("Event loop stopped");
+        result
     }
 
     async fn abort_startup(&mut self, reason: &str) -> anyhow::Result<()> {
@@ -3130,6 +3201,37 @@ fn record_runner_external_msgbus(
     );
 }
 
+async fn wait_for_stop_signal(owns_signals: bool, handle: LiveNodeHandle) {
+    if !owns_signals {
+        return std::future::pending().await;
+    }
+
+    let (signal, result) = tokio::select! {
+        biased;
+        result = dst::signal::ctrl_c() => ("SIGINT", result),
+        result = dst::signal::terminate() => ("SIGTERM", result),
+    };
+
+    match result {
+        Ok(()) => log::info!("Received {signal}, shutting down"),
+        Err(e) => log::error!("Failed to listen for {signal}: {e}"),
+    }
+
+    handle.stop();
+}
+
+async fn complete_before_signal<F, S>(stop_signal: Pin<&mut S>, future: F) -> Option<F::Output>
+where
+    F: Future,
+    S: Future<Output = ()>,
+{
+    tokio::select! {
+        biased;
+        () = stop_signal => None,
+        result = future => Some(result),
+    }
+}
+
 async fn live_timeout_at<F: std::future::Future>(
     deadline: dst::time::Instant,
     future: F,
@@ -3244,7 +3346,11 @@ fn flush_pending_data(
 /// loop. Sufficient for phase 2 where the goal is to capture items the biased
 /// select did not poll before the connect future resolved.
 fn flush_all_pending(pending: &mut PendingEvents, receivers: &mut RunnerReceivers<'_>) {
-    // Flush channel receivers into pending
+    buffer_pending(pending, receivers);
+    pending.drain();
+}
+
+fn buffer_pending(pending: &mut PendingEvents, receivers: &mut RunnerReceivers<'_>) {
     while let Ok(handler) = receivers.time_evt.try_recv() {
         let _ = AsyncRunner::handle_time_event(handler);
     }
@@ -3272,8 +3378,6 @@ fn flush_all_pending(pending: &mut PendingEvents, receivers: &mut RunnerReceiver
     while let Ok(cmd) = receivers.exec_cmd.try_recv() {
         pending.exec_cmds.push(cmd);
     }
-
-    pending.drain();
 }
 
 async fn drive_with_account_events<F: std::future::Future>(
@@ -3641,6 +3745,78 @@ mod tests {
         socket::SocketControl,
     };
 
+    #[tokio::test]
+    async fn test_stop_signal_preempts_ready_startup_work() {
+        let (send_signal, receive_signal) = tokio::sync::oneshot::channel();
+        let stop_signal = async { receive_signal.await.unwrap() };
+        tokio::pin!(stop_signal);
+        let (ready, work) = tokio::sync::oneshot::channel();
+        let phase = complete_before_signal(stop_signal.as_mut(), work);
+        tokio::pin!(phase);
+        assert!(futures_util::poll!(phase.as_mut()).is_pending());
+
+        ready.send(()).unwrap();
+        send_signal.send(()).unwrap();
+
+        assert!(phase.await.is_none());
+    }
+
+    #[rstest]
+    #[case::starting(false)]
+    #[case::shutting_down(true)]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_stop_signal_finalizes_kernel_during_early_abort(#[case] shutting_down: bool) {
+        let mut node = LiveNode::build("StartupSignalNode".to_string(), None).unwrap();
+        node.handle.set_starting();
+        node.kernel.start_async().await;
+        if shutting_down {
+            node.handle.set_shutting_down();
+        }
+
+        assert_eq!(node.kernel.ts_shutdown(), None);
+
+        node.run_loop(std::future::ready(()), false).await.unwrap();
+
+        assert!(node.kernel.ts_shutdown().is_some());
+        assert_eq!(node.state(), NodeState::Stopped);
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_signal_precedes_queued_data_dispatch() {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::from_millis(1),
+            ..Default::default()
+        };
+
+        let mut node = LiveNode::build("SignalDispatchNode".to_string(), Some(config)).unwrap();
+        let handle = node.handle();
+        let (send_signal, receive_signal) = tokio::sync::oneshot::channel();
+        let run = node.run_loop(async { receive_signal.await.unwrap() }, false);
+        tokio::pin!(run);
+        assert!(futures_util::poll!(run.as_mut()).is_pending());
+        assert_eq!(handle.state(), NodeState::Running);
+
+        let observed = Rc::new(Cell::new(None));
+        msgbus::register_data_endpoint(
+            MessagingSwitchboard::data_engine_process_data(),
+            TypedIntoHandler::from({
+                let handle = handle.clone();
+                let observed = Rc::clone(&observed);
+                move |_| observed.set(Some(handle.state()))
+            }),
+        );
+
+        get_data_event_sender().send(stub_data_event()).unwrap();
+        handle.stop();
+        send_signal.send(()).unwrap();
+        run.await.unwrap();
+
+        assert_eq!(observed.get(), Some(NodeState::ShuttingDown));
+        assert_eq!(handle.state(), NodeState::Stopped);
+    }
+
     struct ExternalIngressLogCapture {
         messages: Mutex<Vec<String>>,
     }
@@ -3914,7 +4090,6 @@ mod tests {
             timeout_portfolio: Duration::ZERO,
             timeout_disconnection: Duration::ZERO,
             delay_post_stop: Duration::ZERO,
-            timeout_shutdown: Duration::ZERO,
             ..Default::default()
         };
 
@@ -4545,7 +4720,6 @@ mod tests {
             timeout_portfolio: Duration::ZERO,
             timeout_disconnection: Duration::ZERO,
             delay_post_stop: Duration::ZERO,
-            timeout_shutdown: Duration::ZERO,
             ..Default::default()
         };
 
@@ -7110,7 +7284,7 @@ mod tests {
             .unwrap()
             .with_reconciliation(false)
             .with_delay_post_stop_secs(0)
-            .with_timeout_connection(1)
+            .with_timeout_connection_secs(1)
             .build()
             .unwrap();
         let instrument_id = InstrumentId::from("AUDUSD.SIM");
@@ -7292,7 +7466,7 @@ mod tests {
             .unwrap()
             .with_reconciliation(false)
             .with_delay_post_stop_secs(0)
-            .with_timeout_connection(1)
+            .with_timeout_connection_secs(1)
             .build()
             .unwrap();
         let instrument_id = InstrumentId::from("AUDUSD.SIM");
@@ -7339,7 +7513,7 @@ mod tests {
             .unwrap()
             .with_reconciliation(false)
             .with_delay_post_stop_secs(0)
-            .with_timeout_connection(1)
+            .with_timeout_connection_secs(1)
             .build()
             .unwrap();
         let instrument_id = InstrumentId::from("AUDUSD.SIM");
@@ -7375,7 +7549,7 @@ mod tests {
             .unwrap()
             .with_reconciliation(false)
             .with_delay_post_stop_secs(0)
-            .with_timeout_connection(1)
+            .with_timeout_connection_secs(1)
             .build()
             .unwrap();
         let existing_instrument_id = InstrumentId::from("AUDUSD.SIM");
@@ -7458,7 +7632,7 @@ mod tests {
             .unwrap()
             .with_reconciliation(false)
             .with_delay_post_stop_secs(0)
-            .with_timeout_connection(1)
+            .with_timeout_connection_secs(1)
             .build()
             .unwrap();
         let strategy_id = StrategyId::from("FUNDING_ARBITRAGE-001");
@@ -9240,6 +9414,60 @@ mod tests {
         assert!(node.runner.is_none());
     }
 
+    #[cfg(all(unix, not(madsim)))]
+    #[tokio::test]
+    async fn test_run_event_store_replay_leaves_process_signal_disposition() {
+        use std::{os::unix::process::ExitStatusExt, process::Command};
+
+        const REPLAY_CHILD: &str = "NAUTILUS_LIVE_REPLAY_SIGNAL_CHILD";
+
+        if std::env::var_os(REPLAY_CHILD).is_some() {
+            let mut node = live_node_with_replay_store(false);
+            node.run().await.unwrap();
+            assert_eq!(node.state(), NodeState::Running);
+            assert!(node.kernel.is_event_store_replay());
+
+            let status = Command::new("kill")
+                .args(["-s", "TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            std::future::pending::<()>().await;
+        }
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "node::tests::test_run_event_store_replay_leaves_process_signal_disposition",
+            ])
+            .env(REPLAY_CHILD, "1")
+            .spawn()
+            .unwrap();
+
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        if status.is_err() {
+            let _ = child.kill();
+            child.wait().unwrap();
+        }
+
+        assert_eq!(
+            status
+                .expect("replay child did not exit after SIGTERM")
+                .signal(),
+            Some(15)
+        );
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_run_event_store_replay_preserves_stop_request() {
@@ -9424,7 +9652,6 @@ mod tests {
             timeout_connection: Duration::ZERO,
             timeout_reconciliation: Duration::ZERO,
             timeout_portfolio: Duration::ZERO,
-            timeout_shutdown: Duration::ZERO,
             ..Default::default()
         };
 
@@ -9723,16 +9950,21 @@ mod tests {
             .with_instance_id(UUID4::new())
             .with_load_state(false)
             .with_save_state(true)
-            .with_timeout_connection(30)
-            .with_timeout_reconciliation(60)
+            .with_timeout_connection_secs(30)
+            .with_timeout_reconciliation_secs(60)
             .with_reconciliation(true)
             .with_reconciliation_lookback_mins(120)
-            .with_timeout_portfolio(10)
+            .with_timeout_portfolio_secs(15)
             .with_timeout_disconnection_secs(5)
-            .with_delay_post_stop_secs(3)
-            .with_delay_shutdown_secs(10);
+            .with_delay_post_stop_secs(3);
 
         assert_eq!(builder.name(), "TestNode");
+
+        let node = builder.build().unwrap();
+
+        assert_eq!(node.config.timeout_connection, Duration::from_secs(30));
+        assert_eq!(node.config.timeout_reconciliation, Duration::from_secs(60));
+        assert_eq!(node.config.timeout_portfolio, Duration::from_secs(15));
     }
 
     #[rstest]
@@ -13241,11 +13473,12 @@ mod tests {
     }
 
     mod shutdown {
+        #[cfg(target_os = "linux")]
+        use nautilus_common::live::dst::time;
         use nautilus_common::{
             clients::ExecutionReportTask,
             component::component_state,
             enums::ComponentState,
-            live::dst::time,
             messages::{
                 data::UnsubscribeCommand,
                 execution::{CancelOrder, QueryOrder},
@@ -13694,7 +13927,6 @@ mod tests {
                 timeout_portfolio: Duration::ZERO,
                 timeout_disconnection: Duration::from_millis(10),
                 delay_post_stop: Duration::from_millis(if manage_stop { 250 } else { 50 }),
-                timeout_shutdown: Duration::ZERO,
                 ..Default::default()
             };
 

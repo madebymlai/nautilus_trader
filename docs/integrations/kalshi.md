@@ -1027,8 +1027,10 @@ explains the rounding mechanics; it does not establish `fee_cost` semantics.
   have one balance read per second; each open order also requires event and series fee reads.
 - **Account history**: Each successful recovery publishes `AccountState`, including unchanged
   balances. Set `LiveExecutionEngineConfig.purge_account_events_interval_mins` and
-  `purge_account_events_lookback_mins` to bound in-memory history. Redis and PostgreSQL retain
-  persisted account events for replay.
+  `purge_account_events_lookback_mins` to bound in-memory history. Set `purge_from_database=True`
+  to also purge persisted Redis account events. This flag also applies to closed-order and
+  closed-position purges. PostgreSQL retains the full account history for replay. Check the
+  [Redis cache requirements](../concepts/cache.md#redis) before enabling persisted Redis purges.
 - **Client lifetime**: Private terminal ownership and command identities remain for the execution
   client's lifetime. Purging the shared cache does not prune that state.
 
@@ -1214,7 +1216,7 @@ cached orders. Keep clients active until their positions settle.
 | `http_timeout_secs`                | `60`         | REST attempt timeout in seconds.                                                 |
 | `ws_timeout_secs`                  | `30`         | WebSocket connection, subscription-restoration, and lifecycle-bootstrap timeout. |
 | `book_snapshot_timeout_secs`       | `10`         | Initial and recovery snapshot deadline; `0` disables deadlines.                  |
-| `update_instruments_interval_mins` | `60`         | Delay between completed instrument refreshes.                                    |
+| `update_instruments_interval_mins` | `60`         | Interval (minutes) after each instrument refresh completes.                      |
 | `transport_backend`                | `Sockudo`    | Required WebSocket backend; `Tungstenite` is rejected.                           |
 
 ### Execution client configuration options

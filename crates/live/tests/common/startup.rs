@@ -35,7 +35,10 @@ use nautilus_common::{
         runner::{get_data_event_sender, get_exec_event_sender},
     },
     messages::{DataEvent, ExecutionEvent, execution::CancelOrder},
-    msgbus::{self, MessagingSwitchboard},
+    msgbus::{
+        self, InstrumentSubscription, MessagingSwitchboard, TypedHandler,
+        switchboard::get_instruments_pattern,
+    },
     nautilus_actor,
 };
 use nautilus_core::{Params, UUID4, UnixNanos};
@@ -52,6 +55,7 @@ use nautilus_model::{
     types::{AccountBalance, Currency, MarginBalance, Money},
 };
 use parking_lot::Mutex;
+use rust_decimal::Decimal;
 
 #[derive(Debug)]
 pub(crate) struct StartupActor {
@@ -105,6 +109,7 @@ pub(crate) struct StartupMassStatusExecutionClient {
     oms_type: OmsType,
     handles_all_order_venues: bool,
     cache: CacheView,
+    instrument_subscription: Option<InstrumentSubscription>,
 }
 
 #[derive(Debug)]
@@ -191,6 +196,7 @@ impl ExecutionClientFactory for StartupMassStatusExecutionClientFactory {
             oms_type: self.oms_type,
             handles_all_order_venues: self.handles_all_order_venues,
             cache,
+            instrument_subscription: None,
         }))
     }
 
@@ -252,10 +258,20 @@ impl ExecutionClient for StartupMassStatusExecutionClient {
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
+        let state = self.state.clone();
+        let handler = TypedHandler::from(move |_: &InstrumentAny| {
+            state.instrument_updates.fetch_add(1, Ordering::Relaxed);
+        });
+
+        self.instrument_subscription = Some(InstrumentSubscription::new(
+            get_instruments_pattern(self.venue),
+            handler,
+        ));
         Ok(())
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        self.instrument_subscription.take();
         Ok(())
     }
 
@@ -327,12 +343,6 @@ impl ExecutionClient for StartupMassStatusExecutionClient {
         }
     }
 
-    fn on_instrument(&mut self, _instrument: InstrumentAny) {
-        self.state
-            .instrument_updates
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
     fn register_external_order(
         &self,
         client_order_id: ClientOrderId,
@@ -350,22 +360,28 @@ impl ExecutionClient for StartupMassStatusExecutionClient {
 
 pub(crate) fn add_reconciliation_test_account(node: &LiveNode) {
     let account_id = AccountId::from("BLOCKING-REPORT-001");
+    add_startup_margin_account(node, account_id, Currency::USDT());
+}
+
+pub(crate) fn add_startup_margin_account(
+    node: &LiveNode,
+    account_id: AccountId,
+    currency: Currency,
+) {
+    let total = Money::from_decimal(Decimal::from(1_000_000), currency).unwrap();
+    let zero = Money::zero(currency);
 
     let account = MarginAccount::new(
         AccountState::new(
             account_id,
             AccountType::Margin,
-            vec![AccountBalance::new(
-                Money::from("1000000 USDT"),
-                Money::from("0 USDT"),
-                Money::from("1000000 USDT"),
-            )],
+            vec![AccountBalance::new(total, zero, total)],
             Vec::new(),
             true,
             UUID4::new(),
             UnixNanos::default(),
             UnixNanos::default(),
-            Some(Currency::USDT()),
+            Some(currency),
         ),
         true,
     );

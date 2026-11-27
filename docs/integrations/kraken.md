@@ -45,6 +45,9 @@ The adapter supports these product categories:
 | Spot tokenized assets | ✓         | Loaded from Kraken's `tokenized_asset` asset class. |
 | Futures               | ✓         | Instruments returned by the Kraken Futures API.     |
 
+Spot and Futures data clients refresh instrument definitions every 60 seconds. New and updated definitions
+reach the cache and the corresponding execution client while the node runs.
+
 :::warning
 Kraken Futures can return instrument definitions that need more than standard-precision mode's nine decimal places.
 Keep [high-precision mode](../getting_started/installation.md#precision-mode) enabled for Futures. Standard-precision
@@ -497,6 +500,11 @@ size, so the adapter sends `qtyMode=ABSOLUTE` with every futures edit that resiz
 the order, single or batch. Kraken Futures does not document its answer to a
 total at or below the filled quantity.
 
+A modify's new trigger price goes to Kraken Futures as the edit's `stopPrice`,
+and the open-orders update that follows emits `OrderUpdated` with the new
+trigger. Kraken Spot receives it as the WebSocket amend's `trigger_price`. A
+Spot amend sent over REST does not carry a new trigger price.
+
 Kraken Futures reports each edit's outcome in `editStatus.status`. `edited` and `filled` confirm the
 edit, and the private feeds carry the update or the fills. These statuses refuse the edit and emit
 `OrderModifyRejected`: `invalidSize`, `invalidPrice`, `insufficientAvailableFunds`,
@@ -696,6 +704,16 @@ request requires one shared symbol. Unsupported trigger references fall back to
 the REST path, which rejects them locally before sending a request to Kraken.
 For Spot margin orders, use REST as described under [Spot margin trading](#spot-margin-trading).
 
+A same-instrument order list goes out as one `batch_add` request, and Kraken
+returns its results in request order. The adapter accepts an order whose
+result carries a venue order ID, matching the result by the client order ID
+Kraken echoes. The adapter matches by position when the response holds exactly
+one result per order and every echoed ID agrees with its position. An order
+stays in flight when the result array does not identify it, has no venue order
+ID for it, or includes an error for it. The executions stream or reconciliation
+resolves those orders. When the response reports a batch failure without a result
+array or any per-order results, each order is rejected with Kraken's error.
+
 The per-call `params={"use_ws_trade": False}` override forces a single
 command through REST regardless of the configured default. Set it on
 `SubmitOrder`, `ModifyOrder`, `CancelOrder`, `SubmitOrderList`, or
@@ -857,7 +875,40 @@ page, with a cap of 500 pages per read. Reaching the cap logs a warning:
   `LimitIfTouched` order, so the row fails naming both prices. An open row fails the read; a closed
   row is skipped and leaves the set incomplete.
 - An executions frame states the order's price only when it carries `limit_price`, never at a
-  fill price.
+  fill price. Its trigger is `triggers.price` when `triggers.price_type` is `static`, tracking the
+  `last` or `index` price. A relative or trailing trigger reads as none. A frame without
+  `order_type` reads the trigger of an order the node submitted by the type it was submitted as.
+
+#### Orders placed outside the node
+
+The executions channel covers the whole account, so an order another client places while the node
+runs reaches the adapter as an order it does not track. Kraken states the order's side, type,
+quantity, limit, and trigger on its `pending_new` frame and only some of them on later frames.
+The adapter keeps these terms, including GTD expiry and iceberg display quantity when present,
+by venue order ID until the order's `filled`, `canceled`, or `expired` frame. It keeps at most
+10,000 orders and drops the oldest first. Later reports use the retained terms:
+
+- `pending_new` reports `ACCEPTED`, so the engine creates the external order.
+- Once a frame reports the order triggered, a later frame that states the order open reports
+  `TRIGGERED` until the order has a fill.
+- A valid `trade` frame reports its status and fill together. The reported fill quantity and
+  average price use the trades the stream delivered. A failed parse leaves the trade available
+  for a valid replay or REST reconciliation.
+- Reports use `FILLED` when the stream accounts for the full order quantity. REST reconciliation
+  can supply fills from before the stream first observed the order or during a disconnect.
+
+The execution client resubscribes with `snap_orders` after a WebSocket reconnect. Kraken restates
+each open order's side, type, quantity, and limit. An entry refreshes the retained terms or
+initializes an order the stream first sees in the snapshot. The snapshot supplies order terms.
+Fills missed during the gap stay eligible for REST reconciliation under their venue trade IDs.
+The initial connection omits the snapshot and clears terms from any prior session.
+
+Each frame reports alone, and a trade's fill arrives as its own report, for an order the adapter
+keeps nothing of or one the engine cannot rebuild from its `pending_new` frame or snapshot entry.
+That covers orders open before the node connected, including orders resting across a restart,
+until a reconnect restates them, orders whose trigger `price_type` is not `static`,
+take-profit-limit orders whose trigger sits above a buy limit or below a sell limit, and GTD
+orders whose expiry is absent.
 
 #### Fill reports
 
@@ -1422,7 +1473,7 @@ increase the intervals or reduce `max_requests_per_second`.
 | `book_snapshot_timeout_secs` | `10`      | Snapshot deadline in seconds. `0` disables snapshot deadlines.   |
 | `proxy_url`                  | `None`    | Optional proxy URL for HTTP and WebSocket transports.            |
 | `timeout_secs`               | `30`      | HTTP request timeout in seconds.                                 |
-| `heartbeat_interval_secs`    | `30`      | WebSocket heartbeat interval in seconds.                         |
+| `heartbeat_interval_secs`    | `30`      | Interval (seconds) between WebSocket heartbeats.                 |
 | `ws_idle_timeout_ms`         | `10,000`  | Data-silence timeout for the Spot v2 WebSocket; `0` disables.    |
 | `max_requests_per_second`    | `None`    | Per-client request throttle; default is 5 req/s.                 |
 | `transport_backend`          | `Sockudo` | WebSocket transport backend.                                     |
@@ -1440,7 +1491,7 @@ increase the intervals or reduce `max_requests_per_second`.
 | `ws_url`                        | `None`    | Override for the Kraken WebSocket URL.                                |
 | `proxy_url`                     | `None`    | Optional proxy URL for HTTP and WebSocket transports.                 |
 | `timeout_secs`                  | `30`      | HTTP request timeout in seconds.                                      |
-| `heartbeat_interval_secs`       | `30`      | WebSocket heartbeat interval in seconds.                              |
+| `heartbeat_interval_secs`       | `30`      | Interval (seconds) between WebSocket heartbeats.                      |
 | `auth_timeout_secs`             | `None`    | Futures WebSocket auth timeout; `None` uses the client default.       |
 | `max_requests_per_second`       | `None`    | Per-client request throttle; default is 5 req/s.                      |
 | `max_retries`                   | `3`       | Maximum retry attempts for retryable REST requests.                   |

@@ -39,7 +39,7 @@ use nautilus_common::{
             ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
         },
     },
-    msgbus::{self, TypedHandler},
+    msgbus::{self, InstrumentSubscription, TypedHandler, switchboard::get_instruments_pattern},
 };
 use nautilus_core::{
     AtomicMap, DurationNanos, Params, UUID4, UnixNanos,
@@ -93,7 +93,10 @@ use crate::{
     http::{
         client::AxHttpClient,
         error::AxHttpError,
-        models::{AxOrderRejectReason, PreviewAggressiveLimitOrderRequest, ReplaceOrderRequest},
+        models::{
+            AxOrderRejectReason, AxOrderStatusDetail, PreviewAggressiveLimitOrderRequest,
+            ReplaceOrderRequest,
+        },
         parse::update_order_report_timestamps,
     },
     websocket::{
@@ -115,6 +118,7 @@ pub struct AxExecutionClient {
     emitter: ExecutionEventEmitter,
     http_client: AxHttpClient,
     ws_orders: AxOrdersWebSocketClient,
+    instrument_subscription: Option<InstrumentSubscription>,
     order_event_handler: Option<TypedHandler<OrderEventAny>>,
     session_tasks: TaskGroup,
     pending_tasks: TaskGroup,
@@ -186,6 +190,7 @@ impl AxExecutionClient {
             emitter,
             http_client,
             ws_orders,
+            instrument_subscription: None,
             order_event_handler: None,
             session_tasks,
             pending_tasks,
@@ -204,6 +209,8 @@ impl AxExecutionClient {
 
         let caches = self.ws_orders.caches().clone();
         let account_id = self.core.account_id;
+        let ws_orders = self.ws_orders.clone();
+        let cancel_tasks = self.pending_tasks.spawner().ok();
 
         let handler = TypedHandler::from(move |event: &OrderEventAny| {
             let OrderEventAny::Accepted(accepted) = event else {
@@ -233,6 +240,11 @@ impl AxExecutionClient {
                 caches
                     .venue_to_client_id
                     .insert(accepted.venue_order_id, accepted.client_order_id);
+
+                if let Some(tasks) = &cancel_tasks {
+                    let ws_orders = ws_orders.clone();
+                    let _ = tasks.spawn(async move { ws_orders.send_pending_cancels(None).await });
+                }
             }
         });
 
@@ -318,8 +330,16 @@ impl AxExecutionClient {
         let clock = self.clock;
 
         let http_client = self.http_client.clone();
+        caches
+            .cancel_tracking
+            .lock()
+            .submissions
+            .insert(client_order_id);
 
-        self.spawn_task("submit_order", async move {
+        let task_caches = caches.clone();
+        let spawned = self.spawn_task("submit_order", async move {
+            let caches = task_caches;
+
             // AX emulates market orders with preview-priced IOC limits, so book moves
             // between preview and submission can produce partial fills.
             let (price, submit_time_in_force, submit_post_only) = if order_type
@@ -375,6 +395,7 @@ impl AxExecutionClient {
                     Ok(price) => price,
                     Err(e) => {
                         let reason = e.to_string();
+                        discard_pending_cancels(&caches, client_order_id);
                         log::warn!(
                             "AX market order preview failed for {client_order_id}: {reason}"
                         );
@@ -390,11 +411,12 @@ impl AxExecutionClient {
 
                 (price, TimeInForce::Ioc, false)
             } else {
-                (
-                    limit_price.context("AX limit order is missing a price")?,
-                    time_in_force,
-                    is_post_only,
-                )
+                let Some(price) = limit_price else {
+                    discard_pending_cancels(&caches, client_order_id);
+                    anyhow::bail!("AX limit order is missing a price");
+                };
+
+                (price, time_in_force, is_post_only)
             };
 
             let result = ws_orders
@@ -407,6 +429,7 @@ impl AxExecutionClient {
                     self_trade,
                 )
                 .await;
+            caches.cancel_tracking.lock().submissions.remove(&client_order_id);
 
             if let Err(e) = result {
                 match classify_ax_ws_failure(&e) {
@@ -421,6 +444,7 @@ impl AxExecutionClient {
                             false,
                         );
 
+                        discard_pending_cancels(&caches, client_order_id);
                         let cid = client_order_id_to_cid(&client_order_id);
                         let owns_tracking = caches.orders_metadata.contains_key(&client_order_id)
                             && caches
@@ -447,6 +471,10 @@ impl AxExecutionClient {
 
             Ok(())
         });
+
+        if !spawned {
+            discard_pending_cancels(&caches, client_order_id);
+        }
 
         Ok(())
     }
@@ -494,7 +522,7 @@ impl AxExecutionClient {
         });
     }
 
-    fn spawn_task<F>(&self, description: &'static str, fut: F)
+    fn spawn_task<F>(&self, description: &'static str, fut: F) -> bool
     where
         F: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
@@ -506,7 +534,10 @@ impl AxExecutionClient {
 
         if let Err(e) = self.pending_tasks.spawn(future) {
             log::warn!("Skipping AX {description} after shutdown began: {e}");
+            return false;
         }
+
+        true
     }
 
     fn abort_pending_tasks(&self) {
@@ -596,6 +627,38 @@ impl AxExecutionClient {
     }
 }
 
+impl AxExecutionClient {
+    fn subscribe_instruments(&mut self) {
+        if self.instrument_subscription.is_some() {
+            return;
+        }
+
+        let http_client = self.http_client.clone();
+        let ws_orders = self.ws_orders.clone();
+        self.instrument_subscription = Some(InstrumentSubscription::new(
+            get_instruments_pattern(self.venue()),
+            TypedHandler::from(move |instrument: &InstrumentAny| {
+                Self::apply_instrument(&http_client, &ws_orders, instrument.clone());
+            }),
+        ));
+    }
+
+    fn apply_instrument(
+        http_client: &AxHttpClient,
+        ws_orders: &AxOrdersWebSocketClient,
+        instrument: InstrumentAny,
+    ) {
+        if instrument.id().venue == *AX_VENUE
+            && http_client
+                .get_instrument(&instrument.raw_symbol().inner())
+                .is_none_or(|cached| cached.ts_init() <= instrument.ts_init())
+        {
+            http_client.cache_instrument(instrument.clone());
+            ws_orders.cache_instrument(instrument);
+        }
+    }
+}
+
 #[async_trait(?Send)]
 impl ExecutionClient for AxExecutionClient {
     fn is_connected(&self) -> bool {
@@ -614,6 +677,10 @@ impl ExecutionClient for AxExecutionClient {
         *AX_VENUE
     }
 
+    fn on_instrument(&mut self, instrument: InstrumentAny) {
+        Self::apply_instrument(&self.http_client, &self.ws_orders, instrument);
+    }
+
     fn oms_type(&self) -> OmsType {
         self.core.oms_type
     }
@@ -623,6 +690,8 @@ impl ExecutionClient for AxExecutionClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
+        self.subscribe_instruments();
+
         if self.is_connected() && self.pending_tasks.is_open() && self.session_tasks.is_open() {
             return Ok(());
         }
@@ -676,8 +745,10 @@ impl ExecutionClient for AxExecutionClient {
                 log::warn!("No instruments returned from AX");
             } else {
                 log::debug!("Loaded {} instruments", instruments.len());
-                self.http_client.cache_instruments(&instruments);
-                self.ws_orders.cache_instruments(&instruments);
+
+                for instrument in instruments {
+                    self.on_instrument(instrument);
+                }
             }
             self.core.set_instruments_initialized();
         }
@@ -728,6 +799,7 @@ impl ExecutionClient for AxExecutionClient {
         log::debug!("Connected to orders WebSocket");
 
         let stream = self.ws_orders.stream();
+        let ws_orders = self.ws_orders.clone();
         let emitter = self.emitter.clone();
         let caches = self.ws_orders.caches().clone();
         let account_id = self.core.account_id;
@@ -747,6 +819,7 @@ impl ExecutionClient for AxExecutionClient {
                     &account_fee_rates,
                     clock,
                 );
+                ws_orders.send_pending_cancels(None).await;
             }
         }) {
             if let Err(teardown_error) = self.teardown_partial_connect().await {
@@ -810,11 +883,28 @@ impl ExecutionClient for AxExecutionClient {
         let (session_result, pending_result) =
             tokio::join!(self.await_session_tasks(), self.await_pending_tasks());
 
-        cleanup_deferred_order_tracking(self.ws_orders.caches());
+        let caches = self.ws_orders.caches();
+
+        let mut unresolved: Vec<_> = {
+            let mut tracking = caches.cancel_tracking.lock();
+            tracking.submissions.clear();
+            tracking.intents.values().copied().collect()
+        };
+
+        unresolved.sort_unstable();
+        cleanup_deferred_order_tracking(caches);
         self.core.set_disconnected();
         ws_result?;
         session_result?;
         pending_result?;
+
+        if !unresolved.is_empty() {
+            log::error!(
+                "AX cancellations unresolved at disconnect (client order ID, attempted venue ID): {unresolved:?}"
+            );
+            anyhow::bail!("AX cancellations unresolved at disconnect: {unresolved:?}");
+        }
+
         log::info!("Disconnected: client_id={}", self.core.client_id);
         Ok(())
     }
@@ -836,6 +926,7 @@ impl ExecutionClient for AxExecutionClient {
             .or(cmd.venue_order_id);
         let instrument_id = cmd.instrument_id;
         let emitter = self.emitter.clone();
+        let ws_orders = self.ws_orders.clone();
         let caches = self.ws_orders.caches().clone();
 
         // Read immutable order fields from cache before spawning
@@ -853,7 +944,7 @@ impl ExecutionClient for AxExecutionClient {
 
         self.spawn_task("query_order", async move {
             match http_client
-                .request_order_status(
+                .request_order_status_with_detail(
                     account_id,
                     instrument_id,
                     Some(client_order_id),
@@ -864,13 +955,27 @@ impl ExecutionClient for AxExecutionClient {
                 )
                 .await
             {
-                Ok(report) => {
+                Ok((report, detail)) => {
+                    verify_cancel_query_identity(
+                        &caches,
+                        client_order_id,
+                        venue_order_id,
+                        &detail,
+                    )?;
+
                     if let Some(report) =
                         resolve_order_status_report(&http_client, &caches, client_order_id, report)
                             .await?
                     {
+                        let confirmed_parent = resolve_cancel_status(
+                            &caches,
+                            client_order_id,
+                            report.venue_order_id,
+                            &detail,
+                        );
                         cleanup_resolved_order_status_report(&report, &caches);
                         emitter.send_order_status_report(report);
+                        ws_orders.send_pending_cancels(confirmed_parent).await;
                     }
                 }
                 Err(e) => log::warn!("AX query order failed: {e}"),
@@ -895,6 +1000,8 @@ impl ExecutionClient for AxExecutionClient {
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_instruments();
+
         self.ensure_order_event_subscription();
 
         if self.core.is_started() {
@@ -913,6 +1020,8 @@ impl ExecutionClient for AxExecutionClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        self.instrument_subscription.take();
+
         self.clear_order_event_subscription();
 
         if self.core.is_stopped() {
@@ -930,15 +1039,21 @@ impl ExecutionClient for AxExecutionClient {
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
+        self.instrument_subscription.take();
+
         self.clear_order_event_subscription();
         self.abort_session_tasks();
         self.abort_pending_tasks();
-        cleanup_deferred_order_tracking(self.ws_orders.caches());
+        let caches = self.ws_orders.caches();
+        cleanup_deferred_order_tracking(caches);
+        *caches.cancel_tracking.lock() = Default::default();
         self.core.set_disconnected();
         Ok(())
     }
 
     fn dispose(&mut self) -> anyhow::Result<()> {
+        self.instrument_subscription.take();
+
         self.clear_order_event_subscription();
         self.abort_session_tasks();
         self.abort_pending_tasks();
@@ -1080,6 +1195,7 @@ impl ExecutionClient for AxExecutionClient {
         let clock = self.clock;
         let strategy_id = cmd.strategy_id;
         let instrument_id = cmd.instrument_id;
+        let ws_orders = self.ws_orders.clone();
         let caches = self.ws_orders.caches().clone();
         let client_order_id = cmd.client_order_id;
         let price = cmd.price;
@@ -1109,6 +1225,7 @@ impl ExecutionClient for AxExecutionClient {
                             log::warn!(
                                 "AX replace returned invalid venue order ID for {client_order_id}, awaiting reconciliation: {e}"
                             );
+                            mark_ambiguous_replace(&ws_orders, &http_client, &emitter, client_order_id, venue_order_id).await;
                             return Ok(());
                         }
                     };
@@ -1134,6 +1251,7 @@ impl ExecutionClient for AxExecutionClient {
                             &reason,
                             cmd.command_id,
                         );
+                        ws_orders.send_pending_cancels(None).await;
                     }
                     CommandFailure::VenueRejected(reason) => {
                         complete_pending_modify(&caches, venue_order_id);
@@ -1147,11 +1265,13 @@ impl ExecutionClient for AxExecutionClient {
                             &reason,
                             Some(cmd.command_id),
                         );
+                        ws_orders.send_pending_cancels(None).await;
                     }
                     CommandFailure::Ambiguous(reason) => {
                         log::warn!(
                             "Ambiguous AX modify failure for {client_order_id}, awaiting reconciliation: {reason}"
                         );
+                        mark_ambiguous_replace(&ws_orders, &http_client, &emitter, client_order_id, venue_order_id).await;
                     }
                 },
             }
@@ -1163,7 +1283,22 @@ impl ExecutionClient for AxExecutionClient {
     }
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
-        self.cancel_order_internal(&cmd);
+        let caches = self.ws_orders.caches();
+        if defer_cancel(caches, &cmd) {
+            let ws_orders = self.ws_orders.clone();
+            let http_client = self.http_client.clone();
+            let emitter = self.emitter.clone();
+            let client_order_id = cmd.client_order_id;
+            self.spawn_task("send_pending_cancels", async move {
+                ws_orders.send_pending_cancels(None).await;
+                recover_ambiguous_cancel(&ws_orders, &http_client, &emitter, client_order_id)
+                    .await?;
+                Ok(())
+            });
+        } else {
+            self.cancel_order_internal(&cmd);
+        }
+
         Ok(())
     }
 
@@ -1959,6 +2094,10 @@ fn dispatch_ws_message(
             reason,
             command_id,
         } => {
+            let Some((command_id, attempted_id)) = consume_cancel_denial(caches, command_id) else {
+                return;
+            };
+
             let Some(metadata) = caches.orders_metadata.get(&client_order_id) else {
                 log::error!("Cannot emit cancel denial for uncached order {client_order_id}");
                 return;
@@ -1968,7 +2107,7 @@ fn dispatch_ws_message(
                 metadata.strategy_id,
                 metadata.instrument_id,
                 client_order_id,
-                metadata.venue_order_id,
+                attempted_id.or(metadata.venue_order_id),
                 &reason,
                 clock.get_time_ns(),
                 command_id,
@@ -2093,7 +2232,8 @@ fn dispatch_order_event(
             } else {
                 return;
             }
-            cleanup_terminal_order_tracking(&msg.o, caches);
+
+            cleanup_canceled_order_tracking(&msg.o, caches);
         }
         AxWsOrderEvent::Rejected(msg) => {
             let reason = AxOrderRejectReason::reason_str(msg.r, msg.txt.as_deref())
@@ -2829,6 +2969,17 @@ pub(crate) fn cleanup_terminal_order_tracking(order: &AxWsOrder, caches: &Orders
     cleanup_terminal_order_tracking_ids(caches, Some(&venue_order_id), order.cid, None);
 }
 
+fn cleanup_canceled_order_tracking(order: &AxWsOrder, caches: &OrdersCaches) {
+    if order.o == AxOrderStatus::Canceled
+        && let Ok(id) = VenueOrderId::new_checked(&order.oid)
+        && cancel_attempted_after_ambiguous_replace(caches, id)
+    {
+        caches.pending_modifies.remove(&id);
+    }
+
+    cleanup_terminal_order_tracking(order, caches);
+}
+
 fn cleanup_terminal_order_tracking_ids(
     caches: &OrdersCaches,
     venue_order_id: Option<&VenueOrderId>,
@@ -2855,6 +3006,7 @@ fn cleanup_terminal_order_tracking_ids(
 
     if let Some(client_order_id) = client_order_id {
         caches.orders_metadata.remove(&client_order_id);
+        discard_pending_cancels(caches, client_order_id);
         caches
             .pending_modifies
             .retain(|_, (owner, _, _)| *owner != client_order_id);
@@ -2866,9 +3018,283 @@ fn cleanup_terminal_order_tracking_ids(
             .retain(|_, mapped_client_order_id| *mapped_client_order_id != client_order_id);
     }
 
+    if let Some(venue_order_id) = venue_order_id {
+        caches
+            .cancel_tracking
+            .lock()
+            .ambiguous_replaces
+            .remove(venue_order_id);
+    }
+
     if let Some(cid) = cid {
         caches.cid_to_client_order_id.remove(&cid);
     }
+}
+
+fn defer_cancel(caches: &OrdersCaches, cmd: &CancelOrder) -> bool {
+    let mut tracking = caches.cancel_tracking.lock();
+    let metadata = caches.orders_metadata.get(&cmd.client_order_id);
+    let active = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.venue_order_id)
+        .or(cmd.venue_order_id);
+
+    let deferrable = match active {
+        Some(active) => metadata.is_some() && caches.pending_modifies.contains_key(&active),
+        None => metadata.is_some() || tracking.submissions.contains(&cmd.client_order_id),
+    };
+
+    if deferrable {
+        tracking
+            .intents
+            .entry(cmd.command_id)
+            .or_insert((cmd.client_order_id, None));
+    }
+
+    deferrable
+}
+
+async fn mark_ambiguous_replace(
+    ws_orders: &AxOrdersWebSocketClient,
+    http_client: &AxHttpClient,
+    emitter: &ExecutionEventEmitter,
+    client_order_id: ClientOrderId,
+    parent: VenueOrderId,
+) {
+    let caches = ws_orders.caches();
+    if caches.pending_modifies.contains_key(&parent) {
+        caches
+            .cancel_tracking
+            .lock()
+            .ambiguous_replaces
+            .insert(parent);
+    }
+
+    if let Err(e) = recover_ambiguous_cancel(ws_orders, http_client, emitter, client_order_id).await
+    {
+        log::warn!("AX cancellation recovery failed for {client_order_id}: {e}");
+    }
+}
+
+async fn recover_ambiguous_cancel(
+    ws_orders: &AxOrdersWebSocketClient,
+    http_client: &AxHttpClient,
+    emitter: &ExecutionEventEmitter,
+    client_order_id: ClientOrderId,
+) -> anyhow::Result<()> {
+    let caches = ws_orders.caches();
+
+    let Some((parent, instrument_id)) =
+        caches
+            .orders_metadata
+            .get(&client_order_id)
+            .and_then(|metadata| {
+                metadata
+                    .venue_order_id
+                    .map(|id| (id, metadata.instrument_id))
+            })
+    else {
+        return Ok(());
+    };
+
+    let should_query = {
+        let tracking = caches.cancel_tracking.lock();
+        tracking.ambiguous_replaces.contains(&parent)
+            && tracking
+                .intents
+                .values()
+                .any(|(owner, attempted)| *owner == client_order_id && *attempted != Some(parent))
+    };
+
+    if !should_query {
+        return Ok(());
+    }
+
+    let status = http_client
+        .inner
+        .get_order_status_by_id(parent.as_str())
+        .await?
+        .status;
+    anyhow::ensure!(
+        status.order_id == parent.as_str() && status.symbol == instrument_id.symbol.inner(),
+        "AX cancellation recovery returned an unexpected order identity",
+    );
+
+    if cancel_status_terminal(status.state) {
+        if status.filled_quantity != Some(0) {
+            log::warn!(
+                "AX terminal order {parent} needs fill reconciliation before cancel recovery"
+            );
+            return Ok(());
+        }
+
+        let report = http_client
+            .request_order_report(
+                emitter.account_id(),
+                Some(client_order_id),
+                Some(parent),
+                None::<fn(u64) -> Option<ClientOrderId>>,
+            )
+            .await?
+            .context("AX terminal order history unavailable during cancellation recovery")?;
+        anyhow::ensure!(
+            report.venue_order_id == parent
+                && report.instrument_id == instrument_id
+                && report.order_status.is_closed()
+                && report.order_status != OrderStatus::Filled
+                && report.filled_qty.is_zero(),
+            "AX cancellation recovery did not confirm an unfilled terminal parent",
+        );
+        emitter.send_order_status_report(report);
+    }
+
+    let confirmed_parent = resolve_cancel_status(caches, client_order_id, parent, &status);
+    ws_orders.send_pending_cancels(confirmed_parent).await;
+
+    Ok(())
+}
+
+fn verify_cancel_query_identity(
+    caches: &OrdersCaches,
+    client_order_id: ClientOrderId,
+    venue_order_id: Option<VenueOrderId>,
+    status: &AxOrderStatusDetail,
+) -> anyhow::Result<()> {
+    let tracking = caches.cancel_tracking.lock();
+    if let Some(metadata) = caches.orders_metadata.get(&client_order_id)
+        && tracking
+            .intents
+            .values()
+            .any(|(owner, _)| *owner == client_order_id)
+    {
+        let matches_id = match venue_order_id {
+            Some(id) => status.order_id == id.as_str(),
+            None => status.clord_id == Some(client_order_id_to_cid(&client_order_id)),
+        };
+
+        anyhow::ensure!(
+            matches_id && status.symbol == metadata.instrument_id.symbol.inner(),
+            "AX query returned an unexpected identity for deferred cancel {client_order_id}",
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_cancel_status(
+    caches: &OrdersCaches,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    status: &AxOrderStatusDetail,
+) -> Option<VenueOrderId> {
+    let ambiguous_parent = {
+        let tracking = caches.cancel_tracking.lock();
+        if !tracking
+            .intents
+            .values()
+            .any(|(owner, _)| *owner == client_order_id)
+        {
+            return None;
+        }
+
+        tracking.ambiguous_replaces.contains(&venue_order_id)
+    };
+
+    let mut metadata = caches.orders_metadata.get_mut(&client_order_id)?;
+
+    if status.order_id != venue_order_id.as_str()
+        || status.symbol != metadata.instrument_id.symbol.inner()
+    {
+        return None;
+    }
+
+    if matches!(
+        status.state,
+        AxOrderStatus::Accepted | AxOrderStatus::PartiallyFilled
+    ) {
+        if metadata.venue_order_id.is_none()
+            && status.clord_id == Some(client_order_id_to_cid(&client_order_id))
+        {
+            metadata.venue_order_id = Some(venue_order_id);
+            caches
+                .venue_to_client_id
+                .insert(venue_order_id, client_order_id);
+        }
+
+        return (ambiguous_parent && metadata.venue_order_id == Some(venue_order_id))
+            .then_some(venue_order_id);
+    }
+
+    if ambiguous_parent
+        && metadata.venue_order_id == Some(venue_order_id)
+        && cancel_status_terminal(status.state)
+        && status.filled_quantity == Some(0)
+    {
+        drop(metadata);
+        caches.pending_modifies.remove(&venue_order_id);
+        cleanup_terminal_order_tracking_ids(
+            caches,
+            Some(&venue_order_id),
+            None,
+            Some(client_order_id),
+        );
+    }
+
+    None
+}
+
+fn cancel_status_terminal(status: AxOrderStatus) -> bool {
+    matches!(
+        status,
+        AxOrderStatus::Canceled
+            | AxOrderStatus::Rejected
+            | AxOrderStatus::Expired
+            | AxOrderStatus::DoneForDay
+            | AxOrderStatus::Out
+            | AxOrderStatus::ReconciledOut
+    )
+}
+
+fn consume_cancel_denial(
+    caches: &OrdersCaches,
+    command_id: Option<UUID4>,
+) -> Option<(Option<UUID4>, Option<VenueOrderId>)> {
+    let Some(attempt_id) = command_id else {
+        return Some((None, None));
+    };
+
+    let mut tracking = caches.cancel_tracking.lock();
+
+    let Some((original, _, venue_order_id)) = tracking.attempts.remove(&attempt_id) else {
+        return Some((command_id, None));
+    };
+
+    if tracking.intents.get(&original).and_then(|(_, id)| *id) != Some(venue_order_id) {
+        return None;
+    }
+
+    tracking.intents.remove(&original);
+    Some((Some(original), Some(venue_order_id)))
+}
+
+fn cancel_attempted_after_ambiguous_replace(caches: &OrdersCaches, parent: VenueOrderId) -> bool {
+    let tracking = caches.cancel_tracking.lock();
+    tracking.ambiguous_replaces.contains(&parent)
+        && tracking
+            .intents
+            .values()
+            .any(|(_, attempted)| *attempted == Some(parent))
+}
+
+fn discard_pending_cancels(caches: &OrdersCaches, client_order_id: ClientOrderId) {
+    let mut tracking = caches.cancel_tracking.lock();
+    tracking.submissions.remove(&client_order_id);
+    tracking
+        .attempts
+        .retain(|_, (_, owner, _)| *owner != client_order_id);
+    tracking
+        .intents
+        .retain(|_, (owner, _)| *owner != client_order_id);
 }
 
 fn cleanup_deferred_order_tracking(caches: &OrdersCaches) {
@@ -2892,6 +3318,12 @@ fn complete_pending_modify(caches: &OrdersCaches, venue_order_id: VenueOrderId) 
         });
 
     if let Some((_, (client_order_id, _, terminal))) = completed {
+        caches
+            .cancel_tracking
+            .lock()
+            .ambiguous_replaces
+            .remove(&venue_order_id);
+
         if !caches
             .pending_modifies
             .iter()
@@ -3413,19 +3845,39 @@ mod tests {
             test_metadata(client_order_id, InstrumentId::from("EURUSD-PERP.AX")),
         );
 
-        dispatch_ws_message(
-            AxOrdersWsMessage::CancelOrderError {
-                client_order_id,
-                reason: reason.to_string(),
-                command_id: Some(command_id),
-            },
-            &emitter,
-            &caches,
-            AccountId::from("AX-001"),
-            &instruments,
-            &fee_rates,
-            clock,
-        );
+        let other_cancel_id = UUID4::new();
+        let parent = VenueOrderId::from("OID-UNSENT-PARENT");
+        let child = VenueOrderId::from("OID-UNSENT-CHILD");
+        let parent_attempt = UUID4::new();
+        let child_attempt = UUID4::new();
+
+        {
+            let mut tracking = caches.cancel_tracking.lock();
+            tracking.intents.extend([
+                (command_id, (client_order_id, Some(child))),
+                (other_cancel_id, (client_order_id, None)),
+            ]);
+            tracking.attempts.extend([
+                (parent_attempt, (command_id, client_order_id, parent)),
+                (child_attempt, (command_id, client_order_id, child)),
+            ]);
+        }
+
+        for attempt_id in [parent_attempt, child_attempt] {
+            dispatch_ws_message(
+                AxOrdersWsMessage::CancelOrderError {
+                    client_order_id,
+                    reason: reason.to_string(),
+                    command_id: Some(attempt_id),
+                },
+                &emitter,
+                &caches,
+                AccountId::from("AX-001"),
+                &instruments,
+                &fee_rates,
+                clock,
+            );
+        }
 
         let rejected = rx.try_recv().unwrap();
         assert!(matches!(
@@ -3442,7 +3894,13 @@ mod tests {
                 if event.client_order_id == client_order_id
                     && event.reason == reason
                     && event.causation_id == Some(command_id)
+                    && event.venue_order_id == Some(child)
         ));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            caches.cancel_tracking.lock().intents,
+            AHashMap::from_iter([(other_cancel_id, (client_order_id, None))]),
+        );
     }
 
     #[tokio::test]
@@ -3528,6 +3986,7 @@ mod tests {
             venue_to_client_id: Arc::new(DashMap::new()),
             cid_to_client_order_id: Arc::new(DashMap::new()),
             pending_modifies: Arc::new(DashMap::new()),
+            ..OrdersCaches::default()
         }
     }
 

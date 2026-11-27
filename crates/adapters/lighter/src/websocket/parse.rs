@@ -637,11 +637,7 @@ pub fn parse_ws_fill_report(
         LiquiditySide::Taker
     };
 
-    let venue_order_id = if user_is_bidder {
-        venue_order_id_from(trade.bid_id_str.as_deref(), trade.bid_id)
-    } else {
-        venue_order_id_from(trade.ask_id_str.as_deref(), trade.ask_id)
-    };
+    let venue_order_id = trade_venue_order_id(trade, user_is_bidder);
 
     let trade_id = parse_lighter_trade_id(trade)?;
 
@@ -972,8 +968,22 @@ pub(crate) fn parse_lighter_order_updated(
     trader_id: TraderId,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderUpdated> {
-    let shape =
-        identity.normalize_shape(lighter_order_shape(order, instrument, identity.order_type)?);
+    let shape = lighter_order_shape(order, instrument, identity.order_type)?;
+    order_updated_from_shape(
+        order, shape, identity, cloid, account_id, trader_id, ts_init,
+    )
+}
+
+pub(crate) fn order_updated_from_shape(
+    order: &LighterOrder,
+    shape: OrderShapeSnapshot,
+    identity: &OrderIdentity,
+    cloid: ClientOrderId,
+    account_id: AccountId,
+    trader_id: TraderId,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderUpdated> {
+    let shape = identity.normalize_shape(shape);
     let ts_event = parse_optional_order_timestamp(order.updated_at)?;
     let venue_order_id = VenueOrderId::new(order.order_id.as_str());
 
@@ -1037,11 +1047,7 @@ pub(crate) fn parse_lighter_order_filled(
         LiquiditySide::Taker
     };
 
-    let venue_order_id = if user_is_bidder {
-        venue_order_id_from(trade.bid_id_str.as_deref(), trade.bid_id)
-    } else {
-        venue_order_id_from(trade.ask_id_str.as_deref(), trade.ask_id)
-    };
+    let venue_order_id = trade_venue_order_id(trade, user_is_bidder);
 
     let trade_id = match trade.trade_id_str.as_deref() {
         Some(s) => TradeId::new_checked(s),
@@ -1229,7 +1235,7 @@ pub fn build_unified_account_state(
 /// normalizes second-scale values before nanosecond conversion.
 const UNIX_TIMESTAMP_SECONDS_MAX: i64 = 9_999_999_999;
 
-fn parse_optional_order_timestamp(timestamp: i64) -> anyhow::Result<UnixNanos> {
+pub(crate) fn parse_optional_order_timestamp(timestamp: i64) -> anyhow::Result<UnixNanos> {
     if timestamp <= 0 {
         return Ok(UnixNanos::default());
     }
@@ -1348,6 +1354,14 @@ fn nautilus_order_status(
 
 fn unmapped_order_status() -> anyhow::Error {
     anyhow::anyhow!("Lighter unknown order status has no Nautilus equivalent")
+}
+
+pub(crate) fn trade_venue_order_id(trade: &LighterTrade, user_is_bidder: bool) -> VenueOrderId {
+    if user_is_bidder {
+        venue_order_id_from(trade.bid_id_str.as_deref(), trade.bid_id)
+    } else {
+        venue_order_id_from(trade.ask_id_str.as_deref(), trade.ask_id)
+    }
 }
 
 /// Resolve a venue order id from the venue-provided string field, falling

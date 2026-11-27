@@ -1148,6 +1148,42 @@ def test_data_actor_historical_requests_accept_datetimes_when_registered(
         engine.dispose()
 
 
+def test_data_actor_update_subscriptions_request_holds_live_data_until_completion() -> None:
+    """
+    Test live data published while a request is pending reaches the actor on completion.
+    """
+    data_type = DataType("Payload")
+    events = []
+
+    class Requester(DataActor):
+        def on_start(self) -> None:
+            self.subscribe_data(data_type)
+            params = {"update_subscriptions": True}
+            self.request_data(data_type, ClientId("NO-CLIENT"), params=params)
+
+        def on_data(self, data) -> None:
+            events.append(("data", data.ts_event))
+
+        def on_data_response(self, response) -> None:
+            events.append(("response", response.completed, response.failure_reason is not None))
+
+    class Publisher(DataActor):
+        def on_start(self) -> None:
+            self.publish_data(data_type, _model_custom_data())
+            events.append(("published",))
+
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    engine.add_actor(Requester())
+    engine.add_actor(Publisher())
+
+    try:
+        engine.run()
+
+        assert events == [("published",), ("data", 3), ("response", True, True)]
+    finally:
+        engine.dispose()
+
+
 def _historical_request_time(request_time: object) -> object:
     if request_time == "datetime-utc":
         return dt.datetime(1970, 1, 1, tzinfo=dt.UTC)

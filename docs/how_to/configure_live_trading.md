@@ -81,7 +81,6 @@ config = LiveNodeConfig(
 | `timeout_portfolio_secs`      | 10.0         | Portfolio initialization timeout.                                                |
 | `timeout_disconnection_secs`  | 10.0         | Disconnection timeout.                                                           |
 | `delay_post_stop_secs`        | 10.0         | Delay for residual events after stopping.                                        |
-| `timeout_shutdown_secs`       | 5.0          | Pending-task shutdown timeout in seconds.                                        |
 
 :::warning[Trader ID tag uniqueness]
 The tag after the final hyphen is what reaches generated client order IDs, order list IDs, and
@@ -405,22 +404,23 @@ and caveats, see [Runtime checks](../concepts/execution/reconciliation.md#runtim
 ### Memory management
 
 Periodically purges closed orders, closed positions, and account events from the
-in-memory cache, keeping memory bounded during long-running or HFT sessions. Deleting persisted closed
-orders and positions is optional.
+in-memory cache, keeping memory bounded during long-running or HFT sessions. Purging persisted
+closed orders, closed positions, and Redis account events is optional.
 
-| Setting                                | Default | Description                                                                                         |
-| -------------------------------------- | ------- | --------------------------------------------------------------------------------------------------- |
-| `purge_closed_orders_interval_mins`    | None    | How often (minutes) to purge closed orders from memory. Recommended: 10-15 min.                     |
-| `purge_closed_orders_buffer_mins`      | None    | How long (minutes) an order must be closed before purging. Recommended: 60 min.                     |
-| `purge_closed_positions_interval_mins` | None    | How often (minutes) to purge closed positions from memory. Recommended: 10-15 min.                  |
-| `purge_closed_positions_buffer_mins`   | None    | How long (minutes) a position must be closed before purging. Recommended: 60 min.                   |
-| `purge_account_events_interval_mins`   | None    | How often (minutes) to purge account events from memory. Recommended: 10-15 min.                    |
-| `purge_account_events_lookback_mins`   | None    | How old (minutes) an account event must be before purging. Recommended: 60 min.                     |
-| `purge_from_database`                  | False   | Also delete persisted closed orders and positions. Redis and Postgres retain account-event history. |
+| Setting                                | Default | Description                                                                        |
+| -------------------------------------- | ------- | ---------------------------------------------------------------------------------- |
+| `purge_closed_orders_interval_mins`    | None    | How often (minutes) to purge closed orders from memory. Recommended: 10-15 min.    |
+| `purge_closed_orders_buffer_mins`      | None    | How long (minutes) an order must be closed before purging. Recommended: 60 min.    |
+| `purge_closed_positions_interval_mins` | None    | How often (minutes) to purge closed positions from memory. Recommended: 10-15 min. |
+| `purge_closed_positions_buffer_mins`   | None    | How long (minutes) a position must be closed before purging. Recommended: 60 min.  |
+| `purge_account_events_interval_mins`   | None    | How often (minutes) to purge account events from memory. Recommended: 10-15 min.   |
+| `purge_account_events_lookback_mins`   | None    | How old (minutes) an account event must be before purging. Recommended: 60 min.    |
+| `purge_from_database`                  | False   | Also purge persisted closed orders, closed positions, and Redis account events.    |
 
 Setting an interval enables the purge loop; leaving it unset disables scheduling and deletion.
-Each loop delegates to the cache APIs described in
-[Cache](../concepts/cache.md).
+Each loop delegates to the [cache purge APIs](../concepts/cache.md#purging-cached-data).
+If you use Redis, check the [Redis cache requirements](../concepts/cache.md#redis) before enabling
+`purge_from_database`.
 
 ## Strategy configuration
 

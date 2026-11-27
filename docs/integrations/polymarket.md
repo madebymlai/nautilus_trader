@@ -3264,7 +3264,7 @@ Class/struct: `PolymarketDataClientConfig`.
 | `http_timeout_secs`                   | `60`      | HTTP timeout in seconds.                                                                      |
 | `ws_timeout_secs`                     | `30`      | Positive WebSocket timeout in seconds per connection attempt, including reconnects.           |
 | `ws_max_subscriptions`                | `200`     | Per-connection subscription cap; the market pool shards across connections at this bound.     |
-| `update_instruments_interval_mins`    | `60`      | Instrument catalog refresh interval in minutes; pass `None` to disable it.                    |
+| `update_instruments_interval_mins`    | `60`      | Interval (minutes) between instrument catalog refreshes. `None` disables periodic refresh.    |
 | `subscribe_new_markets`               | `false`   | Subscribe to discovery and resolution events; also enables `best_bid_ask` quote ticks.        |
 | `new_market_filter`                   | `None`    | Rust-only filter applied to newly discovered markets before instrument emission.              |
 | `new_market_fetch_max_concurrency`    | `8`       | Bound concurrent market fetches from discovery events.                                        |
@@ -3276,12 +3276,12 @@ Class/struct: `PolymarketDataClientConfig`.
 | `auto_load_retry_delay_initial_secs`  | `5.0`     | Initial auto-load retry delay in seconds.                                                     |
 | `auto_load_retry_delay_max_secs`      | `15.0`    | Maximum auto-load retry delay in seconds.                                                     |
 | `resolve_poll_enabled`                | `true`    | Poll expired watched conditions for resolution.                                               |
-| `resolve_poll_interval_secs`          | `30`      | Resolution polling interval in seconds.                                                       |
+| `resolve_poll_interval_secs`          | `30`      | Interval (seconds) between resolution polls.                                                  |
 | `resolve_poll_grace_secs`             | `10`      | Delay in seconds after expiry before polling begins.                                          |
 | `resolve_poll_max_wait_secs`          | `1,800`   | Pause automatic polling after this many seconds from expiration.                              |
 | `transport_backend`                   | `Sockudo` | WebSocket transport implementation.                                                           |
 | `book_snapshot_timeout_secs`          | `10`      | Snapshot wait in seconds; `0` disables these deadlines.                                       |
-| `book_stale_check_interval_secs`      | `5`       | Book feed staleness check interval in seconds.                                                |
+| `book_stale_check_interval_secs`      | `5`       | Interval (seconds) between book feed staleness checks.                                        |
 | `book_stale_threshold_secs`           | `0`       | Maximum book feed silence in seconds before reporting stale; `0` disables the monitor.        |
 
 Retry delays must be finite and nonnegative, and the maximum must be at least the initial delay.
@@ -3396,8 +3396,12 @@ them.
 The cache includes metadata needed to understand existing exposure. Strategies must apply their own
 entry scope rather than treating every cached or published instrument as an entry candidate.
 
-Cached open orders and positions without explicit supported protocol metadata are skipped with a warning.
-Confirmed trades on those instruments fail fill-report generation. Reload old cached instruments before trading.
+For reconciliation, older cached instruments without a `market_version` key can use the `version`
+in their saved `gamma_market` JSON when its `conditionId` matches the cached condition. The same
+protocol and Combo validation still applies. An explicit invalid `market_version` is never replaced
+by this fallback, and the cache is not rewritten. Without usable protocol evidence, cached open
+orders and positions are skipped with a warning and confirmed trades fail fill-report generation.
+Reload old cached instruments before submitting or modifying orders.
 
 `event_slugs`, `market_slugs`, `series_ids`, `filters`, and `event_slug_builder` discover instruments. They do
 not classify unmapped records. A node that scopes discovery with those fields and still wants scoped

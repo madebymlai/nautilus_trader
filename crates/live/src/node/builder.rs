@@ -52,7 +52,7 @@ use super::{
     LiveNode, LiveNodeHandle,
     config::{
         LiveDataEngineConfig, LiveExecutionEngineConfig, LiveNodeConfig, LiveRiskEngineConfig,
-        RoutingConfig, validate_live_environment,
+        RoutingConfig, SubmissionRecoveryPolicy, validate_live_environment,
     },
 };
 use crate::{
@@ -245,14 +245,14 @@ impl LiveNodeBuilder {
 
     /// Set the connection timeout in seconds.
     #[must_use]
-    pub const fn with_timeout_connection(mut self, timeout_secs: u64) -> Self {
+    pub const fn with_timeout_connection_secs(mut self, timeout_secs: u64) -> Self {
         self.config.timeout_connection = Duration::from_secs(timeout_secs);
         self
     }
 
     /// Set the reconciliation timeout in seconds.
     #[must_use]
-    pub const fn with_timeout_reconciliation(mut self, timeout_secs: u64) -> Self {
+    pub const fn with_timeout_reconciliation_secs(mut self, timeout_secs: u64) -> Self {
         self.config.timeout_reconciliation = Duration::from_secs(timeout_secs);
         self
     }
@@ -273,7 +273,7 @@ impl LiveNodeBuilder {
 
     /// Set the portfolio initialization timeout in seconds.
     #[must_use]
-    pub const fn with_timeout_portfolio(mut self, timeout_secs: u64) -> Self {
+    pub const fn with_timeout_portfolio_secs(mut self, timeout_secs: u64) -> Self {
         self.config.timeout_portfolio = Duration::from_secs(timeout_secs);
         self
     }
@@ -289,13 +289,6 @@ impl LiveNodeBuilder {
     #[must_use]
     pub const fn with_delay_post_stop_secs(mut self, delay_secs: u64) -> Self {
         self.config.delay_post_stop = Duration::from_secs(delay_secs);
-        self
-    }
-
-    /// Set the shutdown timeout in seconds.
-    #[must_use]
-    pub const fn with_delay_shutdown_secs(mut self, delay_secs: u64) -> Self {
-        self.config.timeout_shutdown = Duration::from_secs(delay_secs);
         self
     }
 
@@ -569,6 +562,7 @@ impl LiveNodeBuilder {
     ///
     /// Returns an error if node construction fails, including conflicting execution routes
     /// or multiple execution clients for a venue without an explicit route or default client.
+    /// The node's submission recovery policy must satisfy all execution client requirements.
     /// Also returns an error if another live node exists or is being built on this thread.
     pub fn build(mut self) -> anyhow::Result<LiveNode> {
         self.build_in_place()
@@ -584,6 +578,7 @@ impl LiveNodeBuilder {
         );
 
         self.config.validate_runtime_support()?;
+        self.validate_submission_recovery_policy()?;
 
         if self.config.event_store.is_some() && self.event_store_factory.is_none() {
             anyhow::bail!(
@@ -672,6 +667,26 @@ impl LiveNodeBuilder {
         log::info!("Built successfully");
 
         Ok(node)
+    }
+
+    fn validate_submission_recovery_policy(&self) -> anyhow::Result<()> {
+        if self.config.exec_engine.submission_recovery_policy
+            == SubmissionRecoveryPolicy::RetainUnresolved
+        {
+            return Ok(());
+        }
+
+        for (name, entry) in &self.exec_client_factories {
+            if let ExecutionClientFactoryEntry::Adapter(factory) = entry
+                && factory.requires_order_retention_on_command_timeout()
+            {
+                anyhow::bail!(
+                    "Execution client '{name}' requires submission_recovery_policy=RetainUnresolved, configured ResolveLocally"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     fn register_data_clients(
@@ -798,7 +813,6 @@ impl LiveNodeBuilder {
         )?;
 
         for venue in instrument_venues {
-            ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
             if !self_settling_venues.contains(&venue) {
                 ExecutionEngine::subscribe_venue_instrument_closes(&kernel.exec_engine, venue);
             }
