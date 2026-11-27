@@ -15,25 +15,29 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+use ahash::AHashMap;
 use nautilus_common::msgbus::Handler;
-use nautilus_core::WeakCell;
+use nautilus_core::{UnixNanos, WeakCell};
 use nautilus_model::{
     data::{Bar, BarType, QuoteTick, TradeTick},
     identifiers::InstrumentId,
 };
 use ustr::Ustr;
 
+use super::bar::BarAggregatorWarmup;
 use crate::aggregation::{BarAggregator, SpreadQuoteAggregator};
 
 // Between built-in handlers (10) and default user handlers (0)
 pub(super) const BAR_AGGREGATOR_PRIORITY: u32 = 5;
+
+const WARMING_UP: &str = "a warm-up in the engine is not yet released";
 
 /// Holds live data back from a bar aggregator that is still replaying a historical request.
 ///
 /// The buffer collects while it is `Some` and is emptied by [`WarmupBuffer::release`], after which
 /// the handlers holding it pass data straight through again.
 #[derive(Debug)]
-pub(super) struct WarmupBuffer<T>(Rc<RefCell<Option<Vec<T>>>>);
+pub(super) struct WarmupBuffer<T>(Rc<RefCell<Option<WarmupState<T>>>>);
 
 impl<T> Clone for WarmupBuffer<T> {
     fn clone(&self) -> Self {
@@ -41,25 +45,210 @@ impl<T> Clone for WarmupBuffer<T> {
     }
 }
 
-impl<T: Copy> WarmupBuffer<T> {
+impl<T: WarmupData> WarmupBuffer<T> {
     pub(super) fn new() -> Self {
-        Self(Rc::new(RefCell::new(Some(Vec::new()))))
+        Self(Rc::new(RefCell::new(Some(WarmupState {
+            held: Vec::new(),
+            held_since: None,
+            history: AHashMap::new(),
+            history_end: None,
+        }))))
     }
 
     /// Holds `item` and returns `true` while warming up, otherwise returns `false`.
     fn hold(&self, item: &T) -> bool {
-        match self.0.borrow_mut().as_mut() {
-            Some(held) => {
-                held.push(*item);
-                true
+        let mut warmup = self.0.borrow_mut();
+        let Some(warmup) = warmup.as_mut() else {
+            return false;
+        };
+
+        let ts_event = item.ts_event();
+        warmup.held_since = Some(
+            warmup
+                .held_since
+                .map_or(ts_event, |since| since.min(ts_event)),
+        );
+        warmup.held.push(*item);
+        true
+    }
+
+    /// Drops the held data and keeps holding.
+    pub(super) fn drop_held(&self) {
+        let mut warmup = self.0.borrow_mut();
+        let warmup = warmup.as_mut().expect(WARMING_UP);
+        warmup.held.clear();
+        warmup.held_since = None;
+    }
+
+    /// Records a historical `item` replayed while warming up.
+    pub(super) fn record_history(&self, item: &T) {
+        let mut warmup = self.0.borrow_mut();
+        let warmup = warmup.as_mut().expect(WARMING_UP);
+        let ts_event = item.ts_event();
+        let held_since = warmup.held_since;
+        // Live data can repeat the history from the first held `ts_event` on
+        let may_repeat = |ts_event| held_since.is_some_and(|since| since <= ts_event);
+
+        match warmup.history_end {
+            Some(end) if ts_event > end => {
+                if !may_repeat(end) {
+                    warmup.history.remove(&end);
+                }
+                warmup.history_end = Some(ts_event);
             }
-            None => false,
+            Some(_) => {}
+            None => warmup.history_end = Some(ts_event),
+        }
+
+        if warmup.history_end == Some(ts_event) || may_repeat(ts_event) {
+            warmup.history.entry(ts_event).or_default().push(*item);
         }
     }
 
-    /// Ends the warm-up and returns the data held in arrival order.
+    /// Ends the warm-up and returns the held data the history did not deliver, in arrival order.
+    ///
+    /// A held item with an identity drops the historical item it copies at its `ts_event`,
+    /// wherever it arrives. A live stream repeats the history from where it starts, so at each
+    /// `ts_event` the copies of items without one are the longest run of held items that repeats
+    /// the end of the history, in order.
     pub(super) fn release(&self) -> Vec<T> {
-        self.0.borrow_mut().take().unwrap_or_default()
+        let WarmupState {
+            held, mut history, ..
+        } = self.0.borrow_mut().take().expect(WARMING_UP);
+        let mut held_by_ts_event: AHashMap<UnixNanos, Vec<usize>> = AHashMap::new();
+
+        for (index, item) in held.iter().enumerate() {
+            held_by_ts_event
+                .entry(item.ts_event())
+                .or_default()
+                .push(index);
+        }
+
+        let mut is_copy = vec![false; held.len()];
+
+        for (ts_event, indices) in &held_by_ts_event {
+            let Some(delivered) = history.get_mut(ts_event) else {
+                continue;
+            };
+
+            if T::HAS_IDENTITY {
+                for &index in indices {
+                    if let Some(position) = delivered.iter().position(|d| held[index].is_copy_of(d))
+                    {
+                        delivered.swap_remove(position);
+                        is_copy[index] = true;
+                    }
+                }
+                continue;
+            }
+
+            let overlap = (1..=indices.len().min(delivered.len()))
+                .rev()
+                .find(|&len| {
+                    indices[..len]
+                        .iter()
+                        .zip(&delivered[delivered.len() - len..])
+                        .all(|(&index, item)| held[index].is_copy_of(item))
+                })
+                .unwrap_or(0);
+
+            for &index in &indices[..overlap] {
+                is_copy[index] = true;
+            }
+        }
+
+        held.into_iter()
+            .zip(is_copy)
+            .filter_map(|(item, is_copy)| (!is_copy).then_some(item))
+            .collect()
+    }
+}
+
+/// The live data held during a warm-up, and the historical items it can repeat.
+///
+/// `history` keeps the historical items from the first held `ts_event` on, and those at the last
+/// historical `ts_event`, which a live stream can replay after the history ends.
+#[derive(Debug)]
+struct WarmupState<T> {
+    held: Vec<T>,
+    held_since: Option<UnixNanos>,
+    history: AHashMap<UnixNanos, Vec<T>>,
+    history_end: Option<UnixNanos>,
+}
+
+/// Data a [`WarmupBuffer`] can match against the history it is replayed with.
+pub(super) trait WarmupData: Copy {
+    /// Whether `is_copy_of` identifies one venue item, so its copy matches wherever it arrives.
+    const HAS_IDENTITY: bool;
+
+    fn ts_event(&self) -> UnixNanos;
+
+    /// Returns whether `other`, at the same `ts_event`, is another copy of the same venue item.
+    fn is_copy_of(&self, other: &Self) -> bool;
+
+    /// Returns the buffer in `warmup` that holds this data type, if any.
+    fn warmup_buffer(warmup: &BarAggregatorWarmup) -> Option<&WarmupBuffer<Self>>;
+}
+
+impl WarmupData for QuoteTick {
+    const HAS_IDENTITY: bool = false;
+
+    fn ts_event(&self) -> UnixNanos {
+        self.ts_event
+    }
+
+    fn is_copy_of(&self, other: &Self) -> bool {
+        self.instrument_id == other.instrument_id
+            && self.bid_price == other.bid_price
+            && self.ask_price == other.ask_price
+            && self.bid_size == other.bid_size
+            && self.ask_size == other.ask_size
+    }
+
+    fn warmup_buffer(warmup: &BarAggregatorWarmup) -> Option<&WarmupBuffer<Self>> {
+        match warmup {
+            BarAggregatorWarmup::Quote(buffer) => Some(buffer),
+            _ => None,
+        }
+    }
+}
+
+impl WarmupData for TradeTick {
+    const HAS_IDENTITY: bool = true;
+
+    fn ts_event(&self) -> UnixNanos {
+        self.ts_event
+    }
+
+    fn is_copy_of(&self, other: &Self) -> bool {
+        self.instrument_id == other.instrument_id && self.trade_id == other.trade_id
+    }
+
+    fn warmup_buffer(warmup: &BarAggregatorWarmup) -> Option<&WarmupBuffer<Self>> {
+        match warmup {
+            BarAggregatorWarmup::Trade(buffer) => Some(buffer),
+            _ => None,
+        }
+    }
+}
+
+impl WarmupData for Bar {
+    const HAS_IDENTITY: bool = true;
+
+    fn ts_event(&self) -> UnixNanos {
+        self.ts_event
+    }
+
+    // A bar type closes one bar at each `ts_event`
+    fn is_copy_of(&self, other: &Self) -> bool {
+        self.bar_type == other.bar_type
+    }
+
+    fn warmup_buffer(warmup: &BarAggregatorWarmup) -> Option<&WarmupBuffer<Self>> {
+        match warmup {
+            BarAggregatorWarmup::Bar(buffer) => Some(buffer),
+            _ => None,
+        }
     }
 }
 
@@ -238,5 +427,152 @@ impl Handler<QuoteTick> for SpreadQuoteHandler {
         if let Some(agg) = self.aggregator.upgrade() {
             agg.borrow_mut().handle_quote_tick(*quote);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::{
+        enums::AggressorSide,
+        identifiers::TradeId,
+        types::{Price, Quantity},
+    };
+    use rstest::rstest;
+
+    use super::*;
+
+    fn quote(bid: &str, ts_event: u64, ts_init: u64) -> QuoteTick {
+        QuoteTick::new(
+            InstrumentId::from("AUD/USD.SIM"),
+            Price::from(bid),
+            Price::from("1.00010"),
+            Quantity::from("1000"),
+            Quantity::from("1000"),
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_init),
+        )
+    }
+
+    fn trade(trade_id: &str, ts_event: u64, ts_init: u64) -> TradeTick {
+        TradeTick::new(
+            InstrumentId::from("AUD/USD.SIM"),
+            Price::from("1.00000"),
+            Quantity::from("1000"),
+            AggressorSide::Buy,
+            TradeId::new(trade_id),
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_init),
+        )
+    }
+
+    #[rstest]
+    fn test_warmup_release_drops_one_held_copy_per_historical_quote() {
+        let warmup = WarmupBuffer::new();
+        let held = [
+            quote("1.00000", 1_000, 1_500),
+            quote("1.00000", 2_000, 2_500),
+            quote("1.00000", 2_000, 2_600),
+            quote("1.00001", 2_000, 2_700),
+            quote("1.00002", 3_000, 3_000),
+        ];
+
+        for item in &held {
+            assert!(warmup.hold(item));
+        }
+        warmup.record_history(&quote("1.00000", 1_000, 1_000));
+        warmup.record_history(&quote("1.00000", 2_000, 2_000));
+
+        assert_eq!(warmup.release(), vec![held[2], held[3], held[4]]);
+        assert!(!warmup.hold(&held[0]));
+    }
+
+    #[rstest]
+    fn test_warmup_release_drops_held_copies_only_in_history_order() {
+        let warmup = WarmupBuffer::new();
+        let returned = quote("1.00000", 5_000, 5_600);
+
+        for item in [quote("1.00001", 5_000, 5_300), returned] {
+            assert!(warmup.hold(&item));
+        }
+        warmup.record_history(&quote("1.00000", 5_000, 5_000));
+        warmup.record_history(&quote("1.00001", 5_000, 5_100));
+
+        assert_eq!(warmup.release(), vec![returned]);
+    }
+
+    #[rstest]
+    fn test_warmup_release_drops_a_held_run_repeating_the_history_end() {
+        let warmup = WarmupBuffer::new();
+
+        for (bid, ts_init) in [("1.00000", 5_300), ("1.00001", 5_400), ("1.00000", 5_500)] {
+            assert!(warmup.hold(&quote(bid, 5_000, ts_init)));
+        }
+
+        for (bid, ts_init) in [("1.00000", 5_000), ("1.00001", 5_100), ("1.00000", 5_200)] {
+            warmup.record_history(&quote(bid, 5_000, ts_init));
+        }
+
+        assert_eq!(warmup.release(), Vec::<QuoteTick>::new());
+    }
+
+    #[rstest]
+    fn test_warmup_release_drops_held_trade_lagging_the_history() {
+        let warmup = WarmupBuffer::new();
+        assert!(warmup.hold(&trade("trade-1", 5_000, 5_500)));
+        warmup.record_history(&trade("trade-1", 5_000, 5_000));
+        warmup.record_history(&trade("trade-2", 5_000, 5_100));
+
+        assert_eq!(warmup.release(), Vec::<TradeTick>::new());
+    }
+
+    #[rstest]
+    fn test_warmup_release_drops_held_bar_for_a_historical_close() {
+        let bar_type = BarType::from("AUD/USD.SIM-1-MINUTE-BID-EXTERNAL");
+        let bar = |close: &str, ts_init: u64| {
+            Bar::new(
+                bar_type,
+                Price::from("1.00000"),
+                Price::from("1.00010"),
+                Price::from("0.99990"),
+                Price::from(close),
+                Quantity::from("1000"),
+                UnixNanos::from(60_000),
+                UnixNanos::from(ts_init),
+            )
+        };
+        let warmup = WarmupBuffer::new();
+        let revised = bar("1.00005", 60_500);
+        let newer = Bar {
+            ts_event: UnixNanos::from(120_000),
+            ..revised
+        };
+
+        for item in [revised, newer] {
+            assert!(warmup.hold(&item));
+        }
+        warmup.record_history(&bar("1.00000", 60_000));
+
+        assert_eq!(warmup.release(), vec![newer]);
+    }
+
+    #[rstest]
+    fn test_warmup_drops_copy_of_history_end_held_after_it() {
+        let warmup = WarmupBuffer::new();
+        warmup.record_history(&quote("1.00000", 1_000, 1_000));
+        warmup.record_history(&quote("1.00000", 2_000, 2_000));
+        let newer = quote("1.00001", 3_000, 3_000);
+
+        assert!(warmup.hold(&quote("1.00000", 2_000, 2_500)));
+        assert!(warmup.hold(&newer));
+        assert_eq!(warmup.release(), vec![newer]);
+    }
+
+    #[rstest]
+    fn test_warmup_release_keeps_held_data_without_history() {
+        let warmup = WarmupBuffer::new();
+        let held = quote("1.00000", 1_000, 1_000);
+        assert!(warmup.hold(&held));
+
+        assert_eq!(warmup.release(), vec![held]);
     }
 }

@@ -32,9 +32,12 @@ use super::{
     TickImbalanceBarAggregator, TickRunsBarAggregator, TimeBarAggregator, UnsubscribeBars,
     UnsubscribeCommand, UnsubscribeQuotes, UnsubscribeTrades, ValueBarAggregator,
     ValueImbalanceBarAggregator, ValueRunsBarAggregator, VolumeBarAggregator,
-    VolumeImbalanceBarAggregator, VolumeRunsBarAggregator, handlers::WarmupBuffer,
+    VolumeImbalanceBarAggregator, VolumeRunsBarAggregator,
+    handlers::{WarmupBuffer, WarmupData},
     log_error_on_cache_insert, process_engine_bar, request_bar_aggregation_from_params,
-    request_params, requests::time_zone_from_params, switchboard,
+    request_params,
+    requests::time_zone_from_params,
+    switchboard,
 };
 
 impl DataEngine {
@@ -110,6 +113,11 @@ impl DataEngine {
                 }
 
                 aggregator.borrow_mut().set_is_running(true);
+            }
+
+            if state.update_subscriptions {
+                self.bar_aggregator_warmups
+                    .insert(key, BarAggregatorWarmup::new(*bar_type));
             }
         }
 
@@ -216,9 +224,11 @@ impl DataEngine {
         key: &BarAggregatorKey,
         has_live_handlers: bool,
     ) {
+        let warmup = self.bar_aggregator_warmups.remove(key);
+
         // Replay buffered updates before closing their last historical interval
         if has_live_handlers
-            && let Some(warmup) = self.bar_aggregator_warmups.remove(key)
+            && let Some(warmup) = warmup
             && let Some(aggregator) = self.bar_aggregators.get(key)
         {
             warmup.release(aggregator.borrow_mut().as_mut());
@@ -287,6 +297,7 @@ impl DataEngine {
             self.update_request_bar_aggregator(*bar_type, aggregator_request_id, |aggregator| {
                 aggregator.handle_quote(quote);
             });
+            self.record_request_history(*bar_type, aggregator_request_id, &quote);
         }
     }
 
@@ -309,6 +320,7 @@ impl DataEngine {
             self.update_request_bar_aggregator(*bar_type, aggregator_request_id, |aggregator| {
                 aggregator.handle_trade(trade);
             });
+            self.record_request_history(*bar_type, aggregator_request_id, &trade);
         }
     }
 
@@ -330,6 +342,24 @@ impl DataEngine {
             self.update_request_bar_aggregator(*bar_type, aggregator_request_id, |aggregator| {
                 aggregator.handle_bar(bar);
             });
+            self.record_request_history(*bar_type, aggregator_request_id, &bar);
+        }
+    }
+
+    fn record_request_history<T: WarmupData>(
+        &self,
+        bar_type: BarType,
+        request_id: Option<UUID4>,
+        item: &T,
+    ) {
+        let key = bar_aggregator_key(bar_type, request_id);
+
+        if let Some(warmup) = self
+            .bar_aggregator_warmups
+            .get(&key)
+            .and_then(T::warmup_buffer)
+        {
+            warmup.record_history(item);
         }
     }
 
@@ -739,28 +769,27 @@ impl DataEngine {
         let mut subscriptions = Vec::new();
 
         let bar_type_std = bar_type.standard();
-        let warmup;
+        let warmup = defer
+            .then(|| self.bar_aggregator_warmups.get(&key))
+            .flatten();
 
         if bar_type.is_composite() {
             let topic = switchboard::get_bars_topic(bar_type.composite());
-            let buffer = defer.then(WarmupBuffer::new);
+            let buffer = warmup.and_then(Bar::warmup_buffer).cloned();
 
-            let handler = TypedHandler::new(
-                BarBarHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
-            );
+            let handler =
+                TypedHandler::new(BarBarHandler::new(aggregator, bar_type_std).with_warmup(buffer));
 
-            warmup = buffer.map(BarAggregatorWarmup::Bar);
             msgbus::subscribe_bars(topic.into(), handler.clone(), None);
             subscriptions.push(BarAggregatorSubscription::Bar { topic, handler });
         } else if bar_type.spec().price_type == PriceType::Last {
             let topic = switchboard::get_trades_topic(bar_type.instrument_id());
-            let buffer = defer.then(WarmupBuffer::new);
+            let buffer = warmup.and_then(TradeTick::warmup_buffer).cloned();
 
             let handler = TypedHandler::new(
-                BarTradeHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
+                BarTradeHandler::new(aggregator, bar_type_std).with_warmup(buffer),
             );
 
-            warmup = buffer.map(BarAggregatorWarmup::Trade);
             msgbus::subscribe_trades(topic.into(), handler.clone(), Some(BAR_AGGREGATOR_PRIORITY));
             subscriptions.push(BarAggregatorSubscription::Trade { topic, handler });
         } else {
@@ -782,21 +811,17 @@ impl DataEngine {
             }
 
             let topic = switchboard::get_quotes_topic(bar_type.instrument_id());
-            let buffer = defer.then(WarmupBuffer::new);
+            let buffer = warmup.and_then(QuoteTick::warmup_buffer).cloned();
 
             let handler = TypedHandler::new(
-                BarQuoteHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
+                BarQuoteHandler::new(aggregator, bar_type_std).with_warmup(buffer),
             );
 
-            warmup = buffer.map(BarAggregatorWarmup::Quote);
             msgbus::subscribe_quotes(topic.into(), handler.clone(), Some(BAR_AGGREGATOR_PRIORITY));
             subscriptions.push(BarAggregatorSubscription::Quote { topic, handler });
         }
 
         self.bar_aggregator_handlers.insert(key, subscriptions);
-        if let Some(warmup) = warmup {
-            self.bar_aggregator_warmups.insert(key, warmup);
-        }
     }
 
     fn subscribe_bar_aggregator(&mut self, cmd: &SubscribeBars) -> Option<SubscribeCommand> {
@@ -1031,12 +1056,16 @@ impl DataEngine {
         aggregator.borrow_mut().stop();
         self.bar_aggregators_pending_stop.remove(&key);
         self.unsubscribe_bar_aggregator_handlers(&key);
+        self.bar_aggregator_warmups.remove(&key);
 
         Ok(())
     }
 
     fn unsubscribe_bar_aggregator_handlers(&mut self, key: &BarAggregatorKey) {
-        self.bar_aggregator_warmups.remove(key);
+        // The held data belongs to the released subscription, the history to the request
+        if let Some(warmup) = self.bar_aggregator_warmups.get(key) {
+            warmup.drop_held();
+        }
 
         // Unsubscribe any registered message handlers
         if let Some(subs) = self.bar_aggregator_handlers.remove(key) {
@@ -1103,7 +1132,10 @@ fn sources_before_dependents(bar_types: &[BarType]) -> Vec<BarType> {
     ordered
 }
 
-/// Live data held back for a bar aggregator that is still replaying a historical request.
+/// The live data a bar aggregator holds while it replays a request's history, and the record of
+/// that history that drops the held copies.
+///
+/// A request with `update_subscriptions` creates it, and it lives until the request completes.
 #[derive(Debug)]
 pub(super) enum BarAggregatorWarmup {
     Bar(WarmupBuffer<Bar>),
@@ -1112,7 +1144,28 @@ pub(super) enum BarAggregatorWarmup {
 }
 
 impl BarAggregatorWarmup {
-    /// Ends the warm-up and feeds the held data to `aggregator` in arrival order.
+    /// Creates the warm-up for the data that `bar_type` aggregates.
+    pub(super) fn new(bar_type: BarType) -> Self {
+        if bar_type.is_composite() {
+            Self::Bar(WarmupBuffer::new())
+        } else if bar_type.spec().price_type == PriceType::Last {
+            Self::Trade(WarmupBuffer::new())
+        } else {
+            Self::Quote(WarmupBuffer::new())
+        }
+    }
+
+    /// Drops the held data and keeps holding.
+    pub(super) fn drop_held(&self) {
+        match self {
+            Self::Bar(buffer) => buffer.drop_held(),
+            Self::Trade(buffer) => buffer.drop_held(),
+            Self::Quote(buffer) => buffer.drop_held(),
+        }
+    }
+
+    /// Ends the warm-up and feeds the held data the history did not deliver to `aggregator` in
+    /// arrival order.
     pub(super) fn release(&self, aggregator: &mut dyn BarAggregator) {
         match self {
             Self::Bar(buffer) => buffer
