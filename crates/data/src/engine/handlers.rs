@@ -30,6 +30,8 @@ use crate::aggregation::{BarAggregator, SpreadQuoteAggregator};
 // Between built-in handlers (10) and default user handlers (0)
 pub(super) const BAR_AGGREGATOR_PRIORITY: u32 = 5;
 
+const WARMING_UP: &str = "a warm-up in the engine is not yet released";
+
 /// Holds live data back from a bar aggregator that is still replaying a historical request.
 ///
 /// The buffer collects while it is `Some` and is emptied by [`WarmupBuffer::release`], after which
@@ -37,16 +39,113 @@ pub(super) const BAR_AGGREGATOR_PRIORITY: u32 = 5;
 #[derive(Debug)]
 pub(super) struct WarmupBuffer<T>(Rc<RefCell<Option<WarmupState<T>>>>);
 
-/// The live data held during a warm-up, and the historical items at the last historical `ts_event`.
+impl<T> Clone for WarmupBuffer<T> {
+    fn clone(&self) -> Self {
+        Self(Rc::clone(&self.0))
+    }
+}
+
+impl<T: WarmupData> WarmupBuffer<T> {
+    pub(super) fn new() -> Self {
+        Self(Rc::new(RefCell::new(Some(WarmupState {
+            held: Vec::new(),
+            held_since: None,
+            history: AHashMap::new(),
+            history_end: None,
+        }))))
+    }
+
+    /// Holds `item` and returns `true` while warming up, otherwise returns `false`.
+    fn hold(&self, item: &T) -> bool {
+        let mut warmup = self.0.borrow_mut();
+        let Some(warmup) = warmup.as_mut() else {
+            return false;
+        };
+
+        let ts_event = item.ts_event();
+        warmup.held_since = Some(
+            warmup
+                .held_since
+                .map_or(ts_event, |since| since.min(ts_event)),
+        );
+        warmup.held.push(*item);
+        true
+    }
+
+    /// Drops the held data and keeps holding.
+    pub(super) fn drop_held(&self) {
+        let mut warmup = self.0.borrow_mut();
+        let warmup = warmup.as_mut().expect(WARMING_UP);
+        warmup.held.clear();
+        warmup.held_since = None;
+    }
+
+    /// Records a historical `item` replayed while warming up.
+    pub(super) fn record_history(&self, item: &T) {
+        let mut warmup = self.0.borrow_mut();
+        let warmup = warmup.as_mut().expect(WARMING_UP);
+        let ts_event = item.ts_event();
+        let held_since = warmup.held_since;
+        // Live data can repeat the history from the first held `ts_event` on
+        let may_repeat = |ts_event| held_since.is_some_and(|since| since <= ts_event);
+
+        match warmup.history_end {
+            Some(end) if ts_event > end => {
+                if !may_repeat(end) {
+                    warmup.history.remove(&end);
+                }
+                warmup.history_end = Some(ts_event);
+            }
+            Some(_) => {}
+            None => warmup.history_end = Some(ts_event),
+        }
+
+        if warmup.history_end == Some(ts_event) || may_repeat(ts_event) {
+            warmup.history.entry(ts_event).or_default().push(*item);
+        }
+    }
+
+    /// Ends the warm-up and returns the held data the history did not deliver, in arrival order.
+    ///
+    /// At each `ts_event`, the held items drop one historical copy each, up to the first that is
+    /// not a copy. A live stream repeats the history from where it starts, so its copies come first.
+    pub(super) fn release(&self) -> Vec<T> {
+        let Some(WarmupState {
+            held, mut history, ..
+        }) = self.0.borrow_mut().take()
+        else {
+            return Vec::new();
+        };
+
+        held.into_iter()
+            .filter(|item| {
+                let ts_event = item.ts_event();
+                let Some(delivered) = history.get_mut(&ts_event) else {
+                    return true;
+                };
+
+                if let Some(index) = delivered.iter().position(|d| d.is_copy_of(item)) {
+                    delivered.swap_remove(index);
+                    false
+                } else {
+                    history.remove(&ts_event);
+                    true
+                }
+            })
+            .collect()
+    }
+}
+
+/// The live data held during a warm-up, and the historical items it can repeat.
 ///
-/// Each historical item drops one held copy of itself, which leaves `None` in its place in `held`,
-/// found through `held_by_ts_event`. The items at the last historical `ts_event` stay recorded, so
-/// a copy that arrives after them, as when a live stream replays its latest item, is dropped too.
+/// `history` keeps the historical items from the first held `ts_event` on, and those at the last
+/// historical `ts_event`, which a live stream can replay after the history ends.
 #[derive(Debug)]
 struct WarmupState<T> {
-    held: Vec<Option<T>>,
-    held_by_ts_event: AHashMap<UnixNanos, Vec<usize>>,
-    history_end: Option<(UnixNanos, Vec<T>)>,
+    held: Vec<T>,
+    held_since: Option<UnixNanos>,
+    history: AHashMap<UnixNanos, Vec<T>>,
+    history_end: Option<UnixNanos>,
 }
 
 /// Data a [`WarmupBuffer`] can match against the history it is replayed with.
@@ -113,94 +212,6 @@ impl WarmupData for Bar {
             BarAggregatorWarmup::Bar(buffer) => Some(buffer),
             _ => None,
         }
-    }
-}
-
-impl<T> Clone for WarmupBuffer<T> {
-    fn clone(&self) -> Self {
-        Self(Rc::clone(&self.0))
-    }
-}
-
-impl<T: WarmupData> WarmupBuffer<T> {
-    pub(super) fn new() -> Self {
-        Self(Rc::new(RefCell::new(Some(WarmupState {
-            held: Vec::new(),
-            held_by_ts_event: AHashMap::new(),
-            history_end: None,
-        }))))
-    }
-
-    /// Holds `item` and returns `true` while warming up, otherwise returns `false`.
-    ///
-    /// A copy of a historical item at the last historical `ts_event` is dropped instead.
-    fn hold(&self, item: &T) -> bool {
-        let mut warmup = self.0.borrow_mut();
-        let Some(warmup) = warmup.as_mut() else {
-            return false;
-        };
-
-        let ts_event = item.ts_event();
-
-        if let Some((last, delivered)) = &mut warmup.history_end
-            && ts_event == *last
-            && let Some(index) = delivered.iter().position(|d| d.is_copy_of(item))
-        {
-            delivered.swap_remove(index);
-            return true;
-        }
-
-        warmup
-            .held_by_ts_event
-            .entry(ts_event)
-            .or_default()
-            .push(warmup.held.len());
-        warmup.held.push(Some(*item));
-        true
-    }
-
-    /// Drops the held data and keeps holding.
-    pub(super) fn drop_held(&self) {
-        if let Some(warmup) = self.0.borrow_mut().as_mut() {
-            warmup.held.clear();
-            warmup.held_by_ts_event.clear();
-        }
-    }
-
-    /// Records a historical `item` replayed while warming up, dropping one held copy of it.
-    pub(super) fn record_history(&self, item: &T) {
-        let mut warmup = self.0.borrow_mut();
-        let Some(warmup) = warmup.as_mut() else {
-            return;
-        };
-
-        let ts_event = item.ts_event();
-
-        match &mut warmup.history_end {
-            Some((last, items)) if ts_event == *last => items.push(*item),
-            Some((last, items)) if ts_event > *last => {
-                *last = ts_event;
-                items.clear();
-                items.push(*item);
-            }
-            Some(_) => {}
-            None => warmup.history_end = Some((ts_event, vec![*item])),
-        }
-
-        if let Some(indices) = warmup.held_by_ts_event.get_mut(&ts_event)
-            && let Some(position) = indices
-                .iter()
-                .position(|&index| warmup.held[index].is_some_and(|held| held.is_copy_of(item)))
-        {
-            warmup.held[indices.swap_remove(position)] = None;
-        }
-    }
-
-    /// Ends the warm-up and returns the held data the history did not deliver, in arrival order.
-    pub(super) fn release(&self) -> Vec<T> {
-        self.0.borrow_mut().take().map_or_else(Vec::new, |warmup| {
-            warmup.held.into_iter().flatten().collect()
-        })
     }
 }
 
@@ -420,6 +431,22 @@ mod tests {
 
         assert_eq!(warmup.release(), vec![held[2], held[3], held[4]]);
         assert!(!warmup.hold(&held[0]));
+    }
+
+    #[rstest]
+    fn test_warmup_release_keeps_quotes_held_after_one_the_history_lacks() {
+        let warmup = WarmupBuffer::new();
+        let held = [
+            quote("1.00001", 5_000, 5_300),
+            quote("1.00000", 5_000, 5_600),
+        ];
+
+        for item in &held {
+            assert!(warmup.hold(item));
+        }
+        warmup.record_history(&quote("1.00000", 5_000, 5_000));
+
+        assert_eq!(warmup.release(), held.to_vec());
     }
 
     #[rstest]
