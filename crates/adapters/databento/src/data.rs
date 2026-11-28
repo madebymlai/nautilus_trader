@@ -934,6 +934,7 @@ impl DataClient for DatabentoDataClient {
 
             for (dataset, ids) in groups {
                 let symbols = historical_client.prepare_symbols_from_instrument_ids(&ids);
+                let parent = infer_symbology_type(&symbols[0]) == dbn::SType::Parent;
 
                 let params = RangeQueryParams {
                     dataset: dataset.clone(),
@@ -945,6 +946,19 @@ impl DataClient for DatabentoDataClient {
                 };
 
                 match historical_client.get_range_instruments(params).await {
+                    // A parent resolves to every contract under it, each at its latest definition
+                    Ok(instruments) if parent => {
+                        if instruments.is_empty() {
+                            failures
+                                .extend(ids.iter().map(|id| format!("Instrument not found: {id}")));
+                        }
+
+                        let latest: IndexMap<_, _> = instruments
+                            .into_iter()
+                            .map(|instrument| (instrument.id(), instrument))
+                            .collect();
+                        data.extend(latest.into_values());
+                    }
                     Ok(instruments) => {
                         for id in ids {
                             if let Some(instrument) = requested_instrument(&instruments, id) {
@@ -960,7 +974,13 @@ impl DataClient for DatabentoDataClient {
 
             let ts_init = get_atomic_clock_realtime().get_time_ns();
 
-            let response = if request.instrument_ids.len() == 1 && data.len() == 1 {
+            // A parent answers with all its contracts, even when it resolves to one
+            let single_parent = request.instrument_ids.len() == 1
+                && infer_symbology_type(request.instrument_ids[0].symbol.as_str())
+                    == dbn::SType::Parent;
+
+            let response = if request.instrument_ids.len() == 1 && data.len() == 1 && !single_parent
+            {
                 let instrument = data.remove(0);
                 Some(DataResponse::Instrument(Box::new(InstrumentResponse::new(
                     request.request_id,
@@ -972,7 +992,7 @@ impl DataClient for DatabentoDataClient {
                     ts_init,
                     request.params,
                 ))))
-            } else if request.instrument_ids.len() > 1 {
+            } else if request.instrument_ids.len() > 1 || (single_parent && !data.is_empty()) {
                 Some(DataResponse::Instruments(InstrumentsResponse::new(
                     request.request_id,
                     client_id,
@@ -2726,6 +2746,132 @@ mod tests {
         assert_eq!(response.client_id(), &client_id);
         assert_eq!(response.params(), Some(&params));
         assert_eq!(response.record_count(), Some(0));
+    }
+
+    #[rstest]
+    #[case::raw("ESU26.GLBX", "ESU6", dbn::SType::RawSymbol, &["ESU6"], &["ESU26.GLBX"])]
+    #[case::parent(
+        "ES.FUT.GLBX",
+        "ES.FUT",
+        dbn::SType::Parent,
+        &["ESU6", "ESZ6"],
+        &["ESU26.GLBX", "ESZ26.GLBX"]
+    )]
+    #[tokio::test]
+    async fn test_request_instrument_returns_resolved_contracts(
+        #[case] instrument_id: &str,
+        #[case] requested_symbol: &str,
+        #[case] stype_in: dbn::SType,
+        #[case] raw_symbols: &[&str],
+        #[case] expected_ids: &[&str],
+    ) {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data/test_data.definition.futures_contract.dbn.zst");
+        let mut decoder = Decoder::from_zstd_file(path).unwrap();
+        let mut metadata = decoder.metadata().clone();
+        let mut definition = decoder
+            .decode_record::<dbn::InstrumentDefMsg>()
+            .unwrap()
+            .unwrap()
+            .clone();
+        let mut definitions = Vec::new();
+        metadata.stype_in = Some(stype_in);
+        metadata.symbols = vec![requested_symbol.to_string()];
+        metadata.mappings = Vec::new();
+
+        for (id, raw) in (1..).zip(raw_symbols) {
+            definition.hd.instrument_id = id;
+            definition.raw_symbol = dbn::record::str_to_c_chars(raw).unwrap();
+            definitions.push(definition.clone());
+            metadata.mappings.push(SymbolMapping {
+                raw_symbol: (*raw).to_string(),
+                intervals: vec![MappingInterval {
+                    start_date: date!(2026 - 06 - 24),
+                    end_date: date!(2026 - 06 - 25),
+                    symbol: id.to_string(),
+                }],
+            });
+        }
+
+        // A later definition of the first contract replaces the earlier one
+        let mut replacement = definitions[0].clone();
+        replacement.ts_recv += 1;
+        let replaced_at = UnixNanos::from(replacement.ts_recv);
+        definitions.push(replacement);
+
+        let mut body = Vec::new();
+        {
+            let mut encoder = dbn::encode::dbn::Encoder::with_zstd(&mut body, &metadata).unwrap();
+            encoder.encode_records(&definitions).unwrap();
+            encoder.flush().unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(serve_historical_response(listener, body));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_data_event_sender(sender);
+
+        let mut config = DatabentoDataClientConfig::new(
+            "32-character-with-lots-of-filler",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("publishers.json"),
+            false,
+            true,
+        );
+        config.historical_base_url = Some(base_url);
+        let client_id = ClientId::from("DATABENTO-INSTRUMENT");
+        let client =
+            DatabentoDataClient::new(client_id, config, get_atomic_clock_realtime()).unwrap();
+        let start = UnixNanos::from(definition.ts_recv);
+        let request_id = UUID4::new();
+
+        client
+            .request_instrument(RequestInstrument::new(
+                InstrumentId::from(instrument_id),
+                Some(start.to_datetime_utc()),
+                Some((start + DurationNanos::new(1)).to_datetime_utc()),
+                Some(client_id),
+                request_id,
+                UnixNanos::from(37),
+                None,
+            ))
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let DataEvent::ResponseEnvelope(envelope) = event else {
+            panic!("expected completed response, received {event:?}");
+        };
+
+        let request = server.await.unwrap();
+        let fields: AHashMap<_, _> = request
+            .split('&')
+            .map(|field| field.split_once('=').unwrap())
+            .collect();
+
+        let instruments = match (stype_in, envelope.response().unwrap()) {
+            (dbn::SType::RawSymbol, DataResponse::Instrument(response)) => {
+                vec![response.data.clone()]
+            }
+            (dbn::SType::Parent, DataResponse::Instruments(response)) => response.data.clone(),
+            (_, response) => panic!("unexpected response for {stype_in}: {response:?}"),
+        };
+        let ids = instruments
+            .iter()
+            .map(|instrument| instrument.id().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(fields["symbols"], requested_symbol);
+        assert_eq!(fields["stype_in"], stype_in.to_string());
+        assert_eq!(envelope.correlation_id(), &request_id);
+        assert!(envelope.completed());
+        assert_eq!(envelope.failure_reason(), None);
+        assert_eq!(ids, expected_ids);
+        assert_eq!(instruments[0].ts_init(), replaced_at);
     }
 
     #[rstest]
