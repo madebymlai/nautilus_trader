@@ -265,7 +265,9 @@ groups identifiers by dataset and preserves successful groups if another group f
 multiple IDs do not accept a record limit.
 
 Book and bar requests require one list member. A parent-symbol `request_book_deltas()` can return
-several book payloads under the same correlation ID; completion follows the last payload.
+several book payloads under the same correlation ID; completion follows the last payload. A
+parent-symbol `request_instrument()` returns every contract the parent resolves to in the range, each
+at its latest definition, as one instruments response.
 
 Actor and Strategy historical requests include both bounds on `ts_init`. Bar requests select bars
 by close time even when `bars_timestamp_on_close=False`. Direct `DatabentoHistoricalClient` calls
